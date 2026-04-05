@@ -30,8 +30,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://tess.im"
-Repository = "https://github.com/tess-ai/langchain-tess"
-Issues = "https://github.com/tess-ai/langchain-tess/issues"
+Repository = "https://github.com/eduresser/langchain-tess"
+Issues = "https://github.com/eduresser/langchain-tess/issues"
 Documentation = "https://docs.tess.im/en/api-overview"
 
 [dependency-groups]
