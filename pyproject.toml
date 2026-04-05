@@ -1,0 +1,138 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-tess"
+version = "0.1.0"
+description = "An integration package connecting Tess AI and LangChain"
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "langchain-core>=0.3.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+    "tiktoken>=0.7.0",
+]
+
+[project.urls]
+Homepage = "https://tess.im"
+Repository = "https://github.com/tess-ai/langchain-tess"
+Issues = "https://github.com/tess-ai/langchain-tess/issues"
+Documentation = "https://docs.tess.im/en/api-overview"
+
+[dependency-groups]
+test = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.24.0,<1.0",
+    "pytest-httpx>=0.34.0,<1.0",
+    "pytest-mock>=3.10.0,<4.0",
+    "pytest-cov>=4.1.0,<5.0",
+    "pytest-socket>=0.6.0,<1.0",
+    "respx>=0.22.0,<1.0",
+    "python-dotenv>=1.0.0,<2.0",
+]
+lint = ["ruff>=0.11.0,<0.12"]
+typing = [
+    "mypy>=1.10,<2.0",
+    "langchain-core>=0.3.0",
+]
+dev = ["langchain-core>=0.3.0"]
+test_integration = [
+    "python-dotenv>=1.0.0,<2.0",
+    "langgraph>=0.2.0",
+]
+
+[tool.mypy]
+disallow_untyped_defs = true
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",   # Messes with the formatter
+    "ISC001",   # Messes with the formatter
+    "PERF203",  # Rarely useful
+    "SIM105",   # Rarely useful
+    "FIX",      # TODOs
+    "TD",       # TODOs
+    "C901",     # Complex functions
+    "PLR0912",  # Too many branches
+    "PLR0913",  # Too many arguments
+    "PLR0914",  # Too many local variables
+    "PLR0915",  # Too many statements
+    "PLR0911",  # Too many return statements
+    "PLR2004",  # Comparison to magic number
+    "ARG001",
+    "ARG002",
+    "ANN401",
+    "BLE001",
+    "ERA001",
+    "RUF001",
+    "RUF012",
+    "TC",
+    "PLC0415",
+    "PT011",
+    "PT013",
+    "TRY",
+    "PLW",
+    "PLE",
+    "FBT",
+    "A001",
+    "B028",
+    "B904",
+    "FA100",    # from __future__ import annotations breaks some schema conversion logic
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+ignore-var-parameters = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/**/*.py" = [
+    "S101",     # Tests need assertions
+    "S311",     # Standard pseudo-random generators are not suitable for cryptographic purposes
+    "SLF001",   # Private member access in tests
+    "D",        # Docstring checks in tests
+    "B018",
+    "PGH003",
+    "PERF401",
+    "PT017",
+    "RUF012",
+    "B017",
+]
+"scripts/*.py" = [
+    "INP001",   # Not a package
+]
+
+[tool.coverage.run]
+omit = ["tests/*"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config --durations=5 --cov=langchain_tess"
+markers = [
+    "requires: mark tests as requiring a specific library",
+    "scheduled: mark tests to run in scheduled testing",
+]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::langchain_core._api.beta_decorator.LangChainBetaWarning",
+]
