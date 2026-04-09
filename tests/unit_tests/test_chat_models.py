@@ -14,8 +14,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
-from langchain_tessai import ChatTessAI
-from langchain_tessai.chat_models import FileRef
+from langchain_tess import ChatTessAI
+from langchain_tess.chat_models import FileRef
 
 API_KEY = "test-api-key-123"
 AGENT_ID = 8794
@@ -106,7 +106,7 @@ class TestProperties:
         assert params["tools"] == "no-tools"
 
     def test_api_key_from_env(self) -> None:
-        with patch.dict("os.environ", {"TESSAI_API_KEY": "env-key-999"}):
+        with patch.dict("os.environ", {"TESS_API_KEY": "env-key-999"}):
             llm = ChatTessAI(agent_id=1, workspace_id=1)
             assert llm.api_key.get_secret_value() == "env-key-999"
 
@@ -1645,7 +1645,7 @@ class TestBuildPayloadFileIds:
 # ==================================================================
 
 
-from langchain_tessai.exceptions import (
+from langchain_tess.exceptions import (
     TessAPIError,
     TessAuthenticationError,
     TessPayloadTooLargeError,

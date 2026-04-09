@@ -1,11 +1,11 @@
-# langchain-tessai
+# langchain-tess
 
 LangChain integration for the [Tess AI](https://tess.im) API.
 
 ## Installation
 
 ```bash
-pip install langchain-tessai
+pip install langchain-tess
 ```
 
 Or for development:
@@ -17,10 +17,10 @@ pip install -e ".[dev]"
 ## Quick Start
 
 ```python
-from langchain_tessai import ChatTessAI
+from langchain_tess import ChatTessAI
 
 llm = ChatTessAI(
-    api_key="YOUR_TESSAI_API_KEY",
+    api_key="YOUR_TESS_API_KEY",
     agent_id=8794,
     model="tess-5",
     temperature=0.5,
@@ -39,7 +39,7 @@ responses = llm.batch(["Hello", "Goodbye"])
 
 # With Tess tools (internet search, etc.)
 llm_web = ChatTessAI(
-    api_key="YOUR_TESSAI_API_KEY",
+    api_key="YOUR_TESS_API_KEY",
     agent_id=8794,
     model="auto",
     tools="search_engines",
@@ -65,7 +65,7 @@ response = llm.invoke([
 
 | Parameter          | Type             | Default                 | Description                                                 |
 | ------------------ | ---------------- | ----------------------- | ----------------------------------------------------------- |
-| `api_key`          | `str`            | -                       | Tess AI API key (or set `TESSAI_API_KEY` env var)           |
+| `api_key`          | `str`            | -                       | Tess AI API key (or set `TESS_API_KEY` env var)             |
 | `agent_id`         | `int`            | -                       | The Tess AI agent ID                                        |
 | `model`            | `str`            | `"tess-5"`              | Model to use                                                |
 | `temperature`      | `float`          | `1.0`                   | Temperature for generation                                  |

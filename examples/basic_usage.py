@@ -1,6 +1,6 @@
-"""Basic usage examples for langchain-tessai.
+"""Basic usage examples for langchain-tess.
 
-Requires a .env file with TESSAI_API_KEY, TESSAI_AGENT_ID, TESSAI_WORKSPACE_ID.
+Requires a .env file with TESS_API_KEY, TESS_AGENT_ID, TESS_WORKSPACE_ID.
 """
 
 import os
@@ -8,15 +8,15 @@ import os
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from langchain_tessai import ChatTessAI
+from langchain_tess import ChatTessAI
 
 load_dotenv()
 
 
 def main() -> None:
-    api_key = os.environ["TESSAI_API_KEY"]
-    agent_id = int(os.environ["TESSAI_AGENT_ID"])
-    workspace_id = int(os.environ["TESSAI_WORKSPACE_ID"])
+    api_key = os.environ["TESS_API_KEY"]
+    agent_id = int(os.environ["TESS_AGENT_ID"])
+    workspace_id = int(os.environ["TESS_WORKSPACE_ID"])
 
     llm = ChatTessAI(
         api_key=api_key,
