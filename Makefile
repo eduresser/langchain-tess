@@ -29,7 +29,7 @@ PYTHON_FILES=.
 MYPY_CACHE=.mypy_cache
 lint format: PYTHON_FILES=.
 lint_diff format_diff: PYTHON_FILES=$(shell git diff --relative --name-only --diff-filter=d master | grep -E '\.py$$|\.ipynb$$')
-lint_package: PYTHON_FILES=langchain_tess
+lint_package: PYTHON_FILES=langchain_tessai
 lint_tests: PYTHON_FILES=tests
 lint_tests: MYPY_CACHE=.mypy_cache_test
 UV_RUN_LINT = uv run --all-groups
@@ -49,7 +49,7 @@ format format_diff:
 	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN_LINT) ruff format $(PYTHON_FILES)
 	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN_LINT) ruff check --fix $(PYTHON_FILES)
 
-check_imports: $(shell find langchain_tess -name '*.py')
+check_imports: $(shell find langchain_tessai -name '*.py')
 	$(UV_RUN_LINT) python ./scripts/check_imports.py $^
 
 ######################
