@@ -1,13 +1,19 @@
-"""JSON-based tool calling support for Tess AI.
+"""JSON-based command calling support for Tess AI.
 
 Since the Tess API does not support native OpenAI-style tool calling,
 this module provides prompt engineering utilities to enforce a JSON-only
-response protocol and parse structured tool call responses.
+response protocol and parse structured command responses.
 
 The model is always instructed to respond with a single JSON object:
-  {"content": "...", "tool_calls": [...]}
+  {"content": "...", "commands": [...]}
 
-The closing ``}`` of the JSON object provides a natural stop boundary —
+The term "commands" is used in the prompt instead of "tools"/"tool_calls"
+to reduce model hallucination (models trained on tool-calling patterns
+tend to simulate tool results when they see "tools" in the prompt).
+Internally, commands are mapped to LangChain's standard tool_calls
+interface.
+
+The closing ``}`` of the JSON object provides a natural stop boundary --
 any hallucinated text after it is trivially discarded by extracting only
 the first balanced JSON object from the raw output.
 """
@@ -49,28 +55,28 @@ Rules:
 - Do NOT wrap the JSON in code fences or backticks."""
 
 JSON_TOOL_CALLING_SYSTEM_PROMPT = """\
-You have access to the following tools:
+You can perform the following commands:
 
 {tool_definitions}
 
 You must ALWAYS respond with a single valid JSON object and nothing else.
 
-When you need to call one or more tools:
-{{"content": "optional short explanation", "tool_calls": [{{"name": "tool_name", "arguments": {{"arg1": "value1"}}}}]}}
+When you need to execute one or more commands:
+{{"content": "optional short explanation", "commands": [{{"name": "command_name", "arguments": {{"arg1": "value1"}}}}]}}
 
-When you do NOT need to call any tool:
+When you do NOT need to execute any command:
 {{"content": "your response text"}}
 
 Rules:
 - Your entire response MUST be exactly one JSON object.
 - The "content" field is REQUIRED and must be a string.
-- The "tool_calls" field is OPTIONAL. Include it ONLY when you need to invoke tools.
-- Each tool call must have "name" (exactly matching a tool name above) and \
-"arguments" (a JSON object matching the tool's parameter schema).
-- You may call multiple tools at once by adding multiple entries to the "tool_calls" array.
+- The "commands" field is OPTIONAL. Include it ONLY when you need to execute commands.
+- Each command must have "name" (exactly matching a command name above) and \
+"arguments" (a JSON object matching the command's parameter schema).
+- You may execute multiple commands at once by adding multiple entries to the "commands" array.
 - Do NOT write any text, markdown, or explanation outside the JSON object.
 - Do NOT wrap the JSON in code fences or backticks.
-- Do NOT simulate or imagine tool results. Stop after emitting the JSON object and wait."""
+- Do NOT simulate or imagine command results. Stop after emitting the JSON object and wait."""
 
 
 # ------------------------------------------------------------------
@@ -111,7 +117,7 @@ def format_tools_for_prompt(tools: List[Dict[str, Any]]) -> str:
 
         params_block = "\n".join(param_lines) if param_lines else "    (no parameters)"
         parts.append(
-            f"Tool: {name}\n"
+            f"Command: {name}\n"
             f"  Description: {description}\n"
             f"  Parameters:\n{params_block}"
         )
@@ -137,14 +143,14 @@ def build_tool_choice_instruction(
 
     if tool_choice == "none" or tool_choice is False:
         return (
-            "\n\nIMPORTANT: Do NOT call any tools. "
-            "Respond with content only. Do NOT include the \"tool_calls\" field."
+            "\n\nIMPORTANT: Do NOT execute any commands. "
+            "Respond with content only. Do NOT include the \"commands\" field."
         )
 
     if tool_choice in ("required", "any") or tool_choice is True:
         return (
-            "\n\nIMPORTANT: You MUST call at least one tool. "
-            "The \"tool_calls\" array is REQUIRED in your response."
+            "\n\nIMPORTANT: You MUST execute at least one command. "
+            "The \"commands\" array is REQUIRED in your response."
         )
 
     if isinstance(tool_choice, dict):
@@ -154,8 +160,8 @@ def build_tool_choice_instruction(
         )
         if name:
             return (
-                f"\n\nIMPORTANT: You MUST call the tool \"{name}\". "
-                f"No other tool is allowed."
+                f"\n\nIMPORTANT: You MUST execute the command \"{name}\". "
+                f"No other command is allowed."
             )
 
     if isinstance(tool_choice, str):
@@ -165,8 +171,8 @@ def build_tool_choice_instruction(
             known_names.add(func.get("name", ""))
         if tool_choice in known_names:
             return (
-                f"\n\nIMPORTANT: You MUST call the tool \"{tool_choice}\". "
-                f"No other tool is allowed."
+                f"\n\nIMPORTANT: You MUST execute the command \"{tool_choice}\". "
+                f"No other command is allowed."
             )
 
     return ""
@@ -233,7 +239,7 @@ def has_trailing_content(text: str) -> bool:
     This detects the hallucination pattern where a model generates a valid
     JSON response and then keeps writing (extra tool calls, fake results,
     etc.).  Only the portion **after** the first closing delimiter is
-    inspected — leading text before the JSON is not considered trailing.
+    inspected -- leading text before the JSON is not considered trailing.
     """
     first_brace = text.find("{")
     first_bracket = text.find("[")
@@ -325,24 +331,24 @@ def deep_parse_json(value: Any) -> Any:
 
 
 def validate_tool_call_contract(data: dict, raw_output: str = "") -> List[dict]:
-    """Validate that *data* follows the expected tool-call contract.
+    """Validate that *data* follows the expected command contract.
 
-    Returns the normalised list of tool-call dicts on success.
+    Returns the normalised list of command dicts on success.
     Raises ``ToolCallParseError`` on any contract violation.
     """
-    tool_calls = data.get("tool_calls")
+    tool_calls = data.get("commands")
     if tool_calls is None:
         raise ToolCallParseError(
-            'Missing "tool_calls" key in parsed JSON', raw_output
+            'Missing "commands" key in parsed JSON', raw_output
         )
     if not isinstance(tool_calls, list):
         raise ToolCallParseError(
-            f'"tool_calls" must be a list, got {type(tool_calls).__name__}',
+            f'"commands" must be a list, got {type(tool_calls).__name__}',
             raw_output,
         )
     if len(tool_calls) == 0:
         raise ToolCallParseError(
-            '"tool_calls" array is empty', raw_output
+            '"commands" array is empty', raw_output
         )
 
     validated: list[dict] = []
@@ -387,7 +393,7 @@ def parse_json_response(text: str) -> Tuple[str, Optional[List[dict]]]:
     optional ``tool_calls`` fields.
 
     Returns:
-        ``(content, tool_calls)`` — *tool_calls* is ``None`` when the
+        ``(content, tool_calls)`` -- *tool_calls* is ``None`` when the
         model did not request any tool invocations.
 
     Raises:
@@ -418,7 +424,7 @@ def parse_json_response(text: str) -> Tuple[str, Optional[List[dict]]]:
             f'"content" must be a string, got {type(content).__name__}', text
         )
 
-    raw_tool_calls = result.get("tool_calls")
+    raw_tool_calls = result.get("commands")
     if raw_tool_calls is None:
         return content, None
 
@@ -478,7 +484,7 @@ class IncrementalJsonContentExtractor:
         characters without finding a ``"content"`` JSON key (or the
         first non-whitespace character is not ``{``), the extractor
         switches to **passthrough mode** and returns raw chunks directly
-        — enabling token-by-token streaming even when the model
+        -- enabling token-by-token streaming even when the model
         responds with plain text instead of the JSON-only protocol.
         """
         self._buffer.append(chunk)
@@ -536,13 +542,13 @@ class IncrementalJsonContentExtractor:
         """Decide whether to abandon JSON extraction and stream raw text.
 
         Switches after *passthrough_threshold* characters have
-        accumulated without finding ``"content"`` (or ``"tool_calls"``).
+        accumulated without finding ``"content"`` (or ``"commands"``).
         This covers plain-text responses, markdown, code-fenced JSON
-        (` ```json\\n{...}``` `), and other non-protocol output — while
+        (` ```json\\n{...}``` `), and other non-protocol output -- while
         giving enough room for leading whitespace or small preambles
         before a valid ``{`` appears.
 
-        Never triggers when ``"tool_calls"`` has already been seen,
+        Never triggers when ``"commands"`` has already been seen,
         since that confirms the JSON-only protocol is in use and
         ``"content"`` is expected to follow.
         """
@@ -553,12 +559,12 @@ class IncrementalJsonContentExtractor:
     def _try_find_content_start(self) -> None:
         buf = self._full_buffer()
         needle = '"content"'
-        tc_needle = '"tool_calls"'
+        tc_needle = '"commands"'
         idx = buf.find(needle, self._scan_pos)
         tc_idx = buf.find(tc_needle, self._scan_pos)
 
         if tc_idx != -1 and (idx == -1 or tc_idx < idx):
-            # "tool_calls" appeared first — skip past it and keep
+            # "commands" appeared first -- skip past it and keep
             # searching for "content" which may follow later.
             self._seen_tool_calls = True
             self._scan_pos = tc_idx + len(tc_needle)

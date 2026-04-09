@@ -89,7 +89,7 @@ def _json_content(text: str) -> str:
 def _json_tool_call(content: str, name: str, arguments: dict) -> str:
     return json.dumps({
         "content": content,
-        "tool_calls": [{"name": name, "arguments": arguments}],
+        "commands": [{"name": name, "arguments": arguments}],
     })
 
 
@@ -108,8 +108,8 @@ class TestParseJsonString:
         assert result == [1, 2, 3]
 
     def test_json_surrounded_by_text(self) -> None:
-        result = parse_json_string('Here is the result: {"tool_calls": []} end')
-        assert result == {"tool_calls": []}
+        result = parse_json_string('Here is the result: {"commands": []} end')
+        assert result == {"commands": []}
 
     def test_no_json_returns_original(self) -> None:
         text = "This is just plain text without any JSON."
@@ -146,7 +146,7 @@ class TestParseJsonResponse:
     def test_content_with_tool_calls(self) -> None:
         raw = json.dumps({
             "content": "Searching...",
-            "tool_calls": [{"name": "get_weather", "arguments": {"city": "SP"}}],
+            "commands": [{"name": "get_weather", "arguments": {"city": "SP"}}],
         })
         content, tc = parse_json_response(raw)
         assert content == "Searching..."
@@ -157,7 +157,7 @@ class TestParseJsonResponse:
         assert tc[0]["id"].startswith("call_")
 
     def test_empty_tool_calls_treated_as_none(self) -> None:
-        raw = '{"content": "No tools needed", "tool_calls": []}'
+        raw = '{"content": "No tools needed", "commands": []}'
         content, tc = parse_json_response(raw)
         assert content == "No tools needed"
         assert tc is None
@@ -165,7 +165,7 @@ class TestParseJsonResponse:
     def test_multiple_tool_calls(self) -> None:
         raw = json.dumps({
             "content": "",
-            "tool_calls": [
+            "commands": [
                 {"name": "search", "arguments": {"q": "test"}},
                 {"name": "get_weather", "arguments": {"city": "SP"}},
             ],
@@ -178,8 +178,8 @@ class TestParseJsonResponse:
     def test_truncates_text_after_json(self) -> None:
         raw = (
             '{"content": "Searching...", '
-            '"tool_calls": [{"name": "search", "arguments": {"q": "llm"}}]}'
-            '\nNow let me also open... {"tool_calls": [{"name": "open", "arguments": {}}]}'
+            '"commands": [{"name": "search", "arguments": {"q": "llm"}}]}'
+            '\nNow let me also open... {"commands": [{"name": "open", "arguments": {}}]}'
             '\nHere are the hallucinated results...'
         )
         content, tc = parse_json_response(raw)
@@ -189,7 +189,7 @@ class TestParseJsonResponse:
         assert tc[0]["name"] == "search"
 
     def test_text_before_json_is_ignored(self) -> None:
-        raw = 'Sure, here it is: {"content": "The answer", "tool_calls": [{"name": "foo", "arguments": {"x": 1}}]}'
+        raw = 'Sure, here it is: {"content": "The answer", "commands": [{"name": "foo", "arguments": {"x": 1}}]}'
         content, tc = parse_json_response(raw)
         assert content == "The answer"
         assert tc is not None
@@ -201,7 +201,7 @@ class TestParseJsonResponse:
 
     def test_missing_content_raises(self) -> None:
         with pytest.raises(ToolCallParseError, match="content"):
-            parse_json_response('{"tool_calls": [{"name": "x", "arguments": {}}]}')
+            parse_json_response('{"commands": [{"name": "x", "arguments": {}}]}')
 
     def test_content_not_string_raises(self) -> None:
         with pytest.raises(ToolCallParseError, match="content.*string"):
@@ -210,12 +210,12 @@ class TestParseJsonResponse:
     def test_invalid_tool_call_contract_raises(self) -> None:
         with pytest.raises(ToolCallParseError, match="arguments"):
             parse_json_response(
-                '{"content": "", "tool_calls": [{"name": "foo"}]}'
+                '{"content": "", "commands": [{"name": "foo"}]}'
             )
 
     def test_tool_calls_before_content(self) -> None:
         raw = json.dumps({
-            "tool_calls": [{"name": "search", "arguments": {"q": "test"}}],
+            "commands": [{"name": "search", "arguments": {"q": "test"}}],
             "content": "Let me search",
         })
         content, tc = parse_json_response(raw)
@@ -226,7 +226,7 @@ class TestParseJsonResponse:
     def test_stringified_arguments_are_deep_parsed(self) -> None:
         raw = json.dumps({
             "content": "",
-            "tool_calls": [{
+            "commands": [{
                 "name": "process",
                 "arguments": {"config": '{"nested": true}'},
             }],
@@ -238,7 +238,7 @@ class TestParseJsonResponse:
     def test_preserves_existing_id(self) -> None:
         raw = json.dumps({
             "content": "",
-            "tool_calls": [{"name": "foo", "arguments": {}, "id": "my-id"}],
+            "commands": [{"name": "foo", "arguments": {}, "id": "my-id"}],
         })
         _, tc = parse_json_response(raw)
         assert tc is not None
@@ -275,7 +275,7 @@ class TestIncrementalExtractor:
 
     def test_tool_calls_before_content_streams_content(self) -> None:
         ext = IncrementalJsonContentExtractor()
-        text = '{"tool_calls": [{"name": "foo", "arguments": {}}], "content": "hi"}'
+        text = '{"commands": [{"name": "foo", "arguments": {}}], "content": "hi"}'
         result = ext.feed(text)
         assert result == "hi"
         assert ext.content_complete
@@ -284,7 +284,7 @@ class TestIncrementalExtractor:
     def test_tool_calls_before_content_incremental(self) -> None:
         ext = IncrementalJsonContentExtractor()
         chunks = [
-            '{"tool_calls": [{"name": "search",',
+            '{"commands": [{"name": "search",',
             ' "arguments": {"q": "test"}}],',
             ' "content": "Let me ',
             'search for that"}',
@@ -297,14 +297,14 @@ class TestIncrementalExtractor:
 
     def test_tool_calls_only_no_content(self) -> None:
         ext = IncrementalJsonContentExtractor(passthrough_threshold=200)
-        text = '{"tool_calls": [{"name": "foo", "arguments": {}}]}'
+        text = '{"commands": [{"name": "foo", "arguments": {}}]}'
         ext.feed(text)
         assert not ext.content_complete
         assert ext.get_full_text() == text
 
     def test_content_with_tool_calls_after(self) -> None:
         ext = IncrementalJsonContentExtractor()
-        text = '{"content": "Searching...", "tool_calls": [{"name": "s", "arguments": {}}]}'
+        text = '{"content": "Searching...", "commands": [{"name": "s", "arguments": {}}]}'
         result = ext.feed(text)
         assert result == "Searching..."
         assert ext.content_complete
@@ -324,7 +324,7 @@ class TestIncrementalExtractor:
 
     def test_empty_content(self) -> None:
         ext = IncrementalJsonContentExtractor()
-        text = '{"content": "", "tool_calls": [{"name": "x", "arguments": {}}]}'
+        text = '{"content": "", "commands": [{"name": "x", "arguments": {}}]}'
         result = ext.feed(text)
         assert result == ""
         assert ext.content_complete
@@ -521,8 +521,8 @@ class TestFormatToolsForPrompt:
 class TestBuildJsonPrompt:
     def test_prompt_with_tools(self) -> None:
         prompt = build_json_prompt([SAMPLE_TOOL])
-        assert "You have access to the following tools" in prompt
-        assert "tool_calls" in prompt
+        assert "You can perform the following commands" in prompt
+        assert "commands" in prompt
         assert "get_weather" in prompt
         assert "single valid JSON object" in prompt
 
@@ -530,7 +530,7 @@ class TestBuildJsonPrompt:
         prompt = build_json_prompt()
         assert "single valid JSON object" in prompt
         assert '"content"' in prompt
-        assert "tool_calls" not in prompt
+        assert "commands" not in prompt
 
     def test_prompt_contains_stop_rule(self) -> None:
         prompt = build_json_prompt([SAMPLE_TOOL])
@@ -544,7 +544,7 @@ class TestBuildJsonPrompt:
 
 class TestValidateContract:
     def test_valid_contract(self) -> None:
-        data = {"tool_calls": [{"name": "foo", "arguments": {"x": 1}}]}
+        data = {"commands": [{"name": "foo", "arguments": {"x": 1}}]}
         result = validate_tool_call_contract(data)
         assert len(result) == 1
         assert result[0]["name"] == "foo"
@@ -556,29 +556,29 @@ class TestValidateContract:
 
     def test_tool_calls_not_a_list(self) -> None:
         with pytest.raises(ToolCallParseError, match="must be a list"):
-            validate_tool_call_contract({"tool_calls": "not-a-list"})
+            validate_tool_call_contract({"commands": "not-a-list"})
 
     def test_empty_tool_calls(self) -> None:
         with pytest.raises(ToolCallParseError, match="empty"):
-            validate_tool_call_contract({"tool_calls": []})
+            validate_tool_call_contract({"commands": []})
 
     def test_missing_name(self) -> None:
         with pytest.raises(ToolCallParseError, match="name"):
-            validate_tool_call_contract({"tool_calls": [{"arguments": {}}]})
+            validate_tool_call_contract({"commands": [{"arguments": {}}]})
 
     def test_missing_arguments(self) -> None:
         with pytest.raises(ToolCallParseError, match="arguments"):
-            validate_tool_call_contract({"tool_calls": [{"name": "foo"}]})
+            validate_tool_call_contract({"commands": [{"name": "foo"}]})
 
     def test_arguments_not_dict(self) -> None:
         with pytest.raises(ToolCallParseError, match="arguments.*dict"):
             validate_tool_call_contract(
-                {"tool_calls": [{"name": "foo", "arguments": "bad"}]}
+                {"commands": [{"name": "foo", "arguments": "bad"}]}
             )
 
     def test_item_not_dict(self) -> None:
         with pytest.raises(ToolCallParseError, match="must be a dict"):
-            validate_tool_call_contract({"tool_calls": ["not-a-dict"]})
+            validate_tool_call_contract({"commands": ["not-a-dict"]})
 
 
 # ==================================================================
@@ -601,7 +601,7 @@ class TestJsonFormatPromptInjection:
         assert len(result) == 2
         assert isinstance(result[0], SystemMessage)
         assert "JSON" in result[0].content
-        assert "tool_calls" not in result[0].content
+        assert "commands" not in result[0].content
 
     def test_merges_with_existing_system(self) -> None:
         msgs = [
@@ -772,7 +772,7 @@ class TestRetryInvalidJson:
 
     def test_retries_contract_violation_then_succeeds(self) -> None:
         llm = _make_llm(max_retries=1)
-        bad_resp = _mock_http_response('{"content": "", "tool_calls": "not-a-list"}')
+        bad_resp = _mock_http_response('{"content": "", "commands": "not-a-list"}')
         good_resp = _mock_http_response(
             _json_tool_call("", "get_weather", {"city": "SP"})
         )
@@ -877,33 +877,33 @@ class TestBuildToolChoiceInstruction:
 
     def test_none_string_disables_tools(self) -> None:
         result = build_tool_choice_instruction("none")
-        assert "Do NOT call any tools" in result
+        assert "Do NOT execute any commands" in result
 
     def test_false_disables_tools(self) -> None:
         result = build_tool_choice_instruction(False)
-        assert "Do NOT call any tools" in result
+        assert "Do NOT execute any commands" in result
 
     def test_required_forces_tool_call(self) -> None:
         result = build_tool_choice_instruction("required")
-        assert "MUST call at least one tool" in result
+        assert "MUST execute at least one command" in result
 
     def test_any_forces_tool_call(self) -> None:
         result = build_tool_choice_instruction("any")
-        assert "MUST call at least one tool" in result
+        assert "MUST execute at least one command" in result
 
     def test_true_forces_tool_call(self) -> None:
         result = build_tool_choice_instruction(True)
-        assert "MUST call at least one tool" in result
+        assert "MUST execute at least one command" in result
 
     def test_dict_with_function_name(self) -> None:
         result = build_tool_choice_instruction(
             {"type": "function", "function": {"name": "get_weather"}}
         )
-        assert 'MUST call the tool "get_weather"' in result
+        assert 'MUST execute the command "get_weather"' in result
 
     def test_string_matching_tool_name(self) -> None:
         result = build_tool_choice_instruction("get_weather", [SAMPLE_TOOL])
-        assert 'MUST call the tool "get_weather"' in result
+        assert 'MUST execute the command "get_weather"' in result
 
     def test_string_not_matching_any_tool(self) -> None:
         result = build_tool_choice_instruction("unknown_tool", [SAMPLE_TOOL])
@@ -913,12 +913,12 @@ class TestBuildToolChoiceInstruction:
 class TestBuildJsonPromptWithToolChoice:
     def test_prompt_with_tool_choice_required(self) -> None:
         prompt = build_json_prompt([SAMPLE_TOOL], tool_choice="required")
-        assert "MUST call at least one tool" in prompt
+        assert "MUST execute at least one command" in prompt
         assert "get_weather" in prompt
 
     def test_prompt_with_tool_choice_none(self) -> None:
         prompt = build_json_prompt([SAMPLE_TOOL], tool_choice="none")
-        assert "Do NOT call any tools" in prompt
+        assert "Do NOT execute any commands" in prompt
 
     def test_prompt_with_tool_choice_auto(self) -> None:
         prompt_auto = build_json_prompt([SAMPLE_TOOL], tool_choice="auto")
