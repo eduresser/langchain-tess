@@ -66,7 +66,7 @@ class TestConvertMessages:
         result = ChatTessAI._convert_messages(msgs)
         parsed = json.loads(result[0]["content"])
         assert parsed["content"] == "Searching"
-        assert parsed["tool_calls"][0]["name"] == "search"
+        assert parsed["commands"][0]["name"] == "search"
 
     def test_system_message_becomes_developer(self) -> None:
         msgs = [SystemMessage(content="you are helpful")]
@@ -686,7 +686,7 @@ class TestConversationTracking:
 
         raw_api = json.dumps({
             "content": "",
-            "tool_calls": [{"name": "dummy_tool", "arguments": {"q": "hello"}}],
+            "commands": [{"name": "dummy_tool", "arguments": {"q": "hello"}}],
         })
 
         def fake_post(self_client, url, **kwargs):
@@ -725,7 +725,7 @@ class TestConversationTracking:
         delta = captured_payloads[1]["messages"]
         assert len(delta) == 1
         assert delta[0]["role"] == "user"
-        assert "[Tool Result]" in delta[0]["content"]
+        assert "[Command Result]" in delta[0]["content"]
 
 
 class TestConversationTrackingDisabled:
@@ -1918,7 +1918,7 @@ class TestToolChoicePrompt:
                     "status": "succeeded",
                     "output": json.dumps({
                         "content": "Checking weather",
-                        "tool_calls": [{"name": "get_weather", "arguments": {"city": "SP"}}],
+                        "commands": [{"name": "get_weather", "arguments": {"city": "SP"}}],
                     }),
                     "credits": 0.006,
                     "root_id": 5001,
@@ -1939,7 +1939,7 @@ class TestToolChoicePrompt:
             bound.invoke("What's the weather in SP?")
 
         developer_msg = captured_payloads[0]["messages"][0]
-        assert "MUST call at least one tool" in developer_msg["content"]
+        assert "MUST execute at least one command" in developer_msg["content"]
 
     def test_tool_choice_none_instruction_in_prompt(self) -> None:
         llm = _make_llm()
@@ -1966,7 +1966,7 @@ class TestToolChoicePrompt:
             bound.invoke("Just chat, no tools")
 
         developer_msg = captured_payloads[0]["messages"][0]
-        assert "Do NOT call any tools" in developer_msg["content"]
+        assert "Do NOT execute any commands" in developer_msg["content"]
 
     def test_tool_choice_specific_tool(self) -> None:
         llm = _make_llm()
@@ -1985,7 +1985,7 @@ class TestToolChoicePrompt:
                     "status": "succeeded",
                     "output": json.dumps({
                         "content": "",
-                        "tool_calls": [{"name": "get_weather", "arguments": {"city": "SP"}}],
+                        "commands": [{"name": "get_weather", "arguments": {"city": "SP"}}],
                     }),
                     "credits": 0.006,
                     "root_id": 5001,
@@ -2009,7 +2009,7 @@ class TestToolChoicePrompt:
             bound.invoke("Weather?")
 
         developer_msg = captured_payloads[0]["messages"][0]
-        assert 'MUST call the tool "get_weather"' in developer_msg["content"]
+        assert 'MUST execute the command "get_weather"' in developer_msg["content"]
 
 
 # ==================================================================
@@ -2040,7 +2040,7 @@ class TestStructuredOutputDict:
                     "status": "succeeded",
                     "output": json.dumps({
                         "content": "",
-                        "tool_calls": [{
+                        "commands": [{
                             "name": "WeatherReport",
                             "arguments": {"city": "SP", "temp": 25},
                         }],
@@ -2075,7 +2075,7 @@ class TestStructuredOutputDict:
                     "status": "succeeded",
                     "output": json.dumps({
                         "content": "",
-                        "tool_calls": [{"name": "Info", "arguments": {"x": "hello"}}],
+                        "commands": [{"name": "Info", "arguments": {"x": "hello"}}],
                     }),
                     "credits": 0.006,
                     "root_id": 5001,
@@ -2107,7 +2107,7 @@ class TestStructuredOutputDict:
                     "status": "succeeded",
                     "output": json.dumps({
                         "content": "",
-                        "tool_calls": [{"name": "structured_output", "arguments": {"a": 42}}],
+                        "commands": [{"name": "structured_output", "arguments": {"a": 42}}],
                     }),
                     "credits": 0.006,
                     "root_id": 5001,
@@ -2141,7 +2141,7 @@ class TestStructuredOutputDict:
                     "status": "succeeded",
                     "output": json.dumps({
                         "content": "",
-                        "tool_calls": [{"name": "Weather", "arguments": {"city": "SP", "temp": 25.0}}],
+                        "commands": [{"name": "Weather", "arguments": {"city": "SP", "temp": 25.0}}],
                     }),
                     "credits": 0.006,
                     "root_id": 5001,

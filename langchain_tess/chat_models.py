@@ -62,6 +62,7 @@ from langchain_tess.tool_calling import (
     parse_json_response,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -723,7 +724,7 @@ class ChatTessAI(BaseChatModel):
             "content": ChatTessAI._content_to_str(msg.content),
         }
         if msg.tool_calls:
-            result["tool_calls"] = [
+            result["commands"] = [
                 {"name": tc["name"], "arguments": tc["args"]}
                 for tc in msg.tool_calls
             ]
@@ -940,9 +941,9 @@ class ChatTessAI(BaseChatModel):
         """Prepend a developer/system message enforcing JSON-only responses.
 
         Always injects the JSON protocol prompt.  When *bound_tools* is
-        provided, includes tool definitions and the ``tool_calls`` field
+        provided, includes command definitions and the ``commands`` field
         documentation.  When *tool_choice* is provided, appends an
-        instruction constraining tool usage.  If the first message is
+        instruction constraining command usage.  If the first message is
         already a SystemMessage, its content is appended after the JSON
         prompt.
         """
@@ -1064,8 +1065,9 @@ class ChatTessAI(BaseChatModel):
                 tool_name = getattr(msg, "name", None) or "unknown_tool"
                 role = "user"
                 content = (
-                    f'[Tool Result] The tool "{tool_name}" returned:\n'
-                    f"{ChatTessAI._content_to_str(msg.content)}"
+                    f'[Command Result] The command "{tool_name}" returned:\n'
+                    f"{ChatTessAI._content_to_str(msg.content)}\n\n"
+                    f'[Respond with a JSON object: {{"content": "your response"}}]'
                 )
             else:
                 role, content = "user", ChatTessAI._content_to_str(msg.content)
@@ -1165,8 +1167,9 @@ class ChatTessAI(BaseChatModel):
                 tool_name = getattr(msg, "name", None) or "unknown_tool"
                 role = "user"
                 content = (
-                    f'[Tool Result] The tool "{tool_name}" returned:\n'
-                    f"{ChatTessAI._content_to_str(msg.content)}"
+                    f'[Command Result] The command "{tool_name}" returned:\n'
+                    f"{ChatTessAI._content_to_str(msg.content)}\n\n"
+                    f'[Respond with a JSON object: {{"content": "your response"}}]'
                 )
             else:
                 role, content = "user", ChatTessAI._content_to_str(msg.content)
@@ -1246,7 +1249,7 @@ class ChatTessAI(BaseChatModel):
 
     @property
     def _upload_headers(self) -> dict:
-        """Headers for file upload requests (no Content-Type — httpx sets multipart)."""
+        """Headers for file upload requests (no Content-Type -- httpx sets multipart)."""
         return {
             "Authorization": f"Bearer {self.api_key.get_secret_value()}",
             "x-workspace-id": str(self.workspace_id),
