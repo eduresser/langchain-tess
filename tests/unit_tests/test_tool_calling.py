@@ -10,8 +10,8 @@ import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from langchain_tess import ChatTessAI, ToolCallParseError
-from langchain_tess.tool_calling import (
+from langchain_tessai import ChatTessAI, ToolCallParseError
+from langchain_tessai.tool_calling import (
     IncrementalJsonContentExtractor,
     build_json_prompt,
     deep_parse_json,
@@ -680,7 +680,7 @@ class TestRetryEmptyResponse:
             return ok_resp
 
         with patch.object(httpx.Client, "post", side_effect=mock_post), \
-             patch("langchain_tess.chat_models.time.sleep"):
+             patch("langchain_tessai.chat_models.time.sleep"):
             result = llm.invoke("hello")
 
         assert result.content == "Finally got a response!"
@@ -691,7 +691,7 @@ class TestRetryEmptyResponse:
         empty_resp = _mock_http_response("")
 
         with patch.object(httpx.Client, "post", return_value=empty_resp), \
-             patch("langchain_tess.chat_models.time.sleep"):
+             patch("langchain_tessai.chat_models.time.sleep"):
             with pytest.raises(ValueError, match="empty response"):
                 llm.invoke("hello")
 
@@ -720,13 +720,13 @@ class TestRetryHTTPError:
             return ok_resp
 
         with patch.object(httpx.Client, "post", side_effect=mock_post), \
-             patch("langchain_tess.chat_models.time.sleep"):
+             patch("langchain_tessai.chat_models.time.sleep"):
             result = llm.invoke("hello")
 
         assert result.content == "Success after retry!"
 
     def test_raises_http_error_after_retries(self) -> None:
-        from langchain_tess.exceptions import TessAPIError
+        from langchain_tessai.exceptions import TessAPIError
 
         llm = _make_llm(max_retries=1)
         error_resp = httpx.Response(
@@ -735,7 +735,7 @@ class TestRetryHTTPError:
         )
 
         with patch.object(httpx.Client, "post", return_value=error_resp), \
-             patch("langchain_tess.chat_models.time.sleep"):
+             patch("langchain_tessai.chat_models.time.sleep"):
             with pytest.raises((httpx.HTTPStatusError, TessAPIError)):
                 llm.invoke("hello")
 
@@ -763,7 +763,7 @@ class TestRetryInvalidJson:
             return good_resp
 
         with patch.object(httpx.Client, "post", side_effect=mock_post), \
-             patch("langchain_tess.chat_models.time.sleep"):
+             patch("langchain_tessai.chat_models.time.sleep"):
             llm_with_tools = llm.bind_tools([SAMPLE_TOOL])
             result = llm_with_tools.invoke("What's the weather?")
 
@@ -787,7 +787,7 @@ class TestRetryInvalidJson:
             return good_resp
 
         with patch.object(httpx.Client, "post", side_effect=mock_post), \
-             patch("langchain_tess.chat_models.time.sleep"):
+             patch("langchain_tessai.chat_models.time.sleep"):
             llm_with_tools = llm.bind_tools([SAMPLE_TOOL])
             result = llm_with_tools.invoke("weather?")
 
@@ -798,7 +798,7 @@ class TestRetryInvalidJson:
         bad_resp = _mock_http_response("Not JSON at all")
 
         with patch.object(httpx.Client, "post", return_value=bad_resp), \
-             patch("langchain_tess.chat_models.time.sleep"):
+             patch("langchain_tessai.chat_models.time.sleep"):
             llm_with_tools = llm.bind_tools([SAMPLE_TOOL])
             with pytest.raises(ValueError, match="Failed to parse tool calls"):
                 llm_with_tools.invoke("weather?")
@@ -865,7 +865,7 @@ class TestMaxRetriesDefault:
 # ==================================================================
 
 
-from langchain_tess.tool_calling import build_tool_choice_instruction
+from langchain_tessai.tool_calling import build_tool_choice_instruction
 
 
 class TestBuildToolChoiceInstruction:

@@ -47,14 +47,14 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr
 
-from langchain_tess.exceptions import (
+from langchain_tessai.exceptions import (
     TessAPIError,
     TessAuthenticationError,
     TessPayloadTooLargeError,
     TessRateLimitError,
     raise_for_tess_status,
 )
-from langchain_tess.tool_calling import (
+from langchain_tessai.tool_calling import (
     IncrementalJsonContentExtractor,
     ToolCallParseError,
     build_json_prompt,
@@ -154,17 +154,17 @@ class ChatTessAI(BaseChatModel):
     """Chat model that uses the Tess AI API.
 
     Setup:
-        Install ``langchain-tess`` and set the ``TESS_API_KEY`` environment variable.
+        Install ``langchain-tessai`` and set the ``TESSAI_API_KEY`` environment variable.
 
         .. code-block:: bash
 
-            pip install langchain-tess
-            export TESS_API_KEY="your-api-key"
+            pip install langchain-tessai
+            export TESSAI_API_KEY="your-api-key"
 
     Usage:
         .. code-block:: python
 
-            from langchain_tess import ChatTessAI
+            from langchain_tessai import ChatTessAI
 
             llm = ChatTessAI(
                 agent_id=8794,
@@ -198,7 +198,7 @@ class ChatTessAI(BaseChatModel):
     api_key: SecretStr = Field(
         default=None,
         alias="tess_api_key",
-        description="Tess AI API key. Can also be set via TESS_API_KEY env var.",
+        description="Tess AI API key. Can also be set via TESSAI_API_KEY env var.",
     )
     agent_id: int = Field(description="The Tess AI agent ID to use.")
     model: str = Field(default="tess-5", description="Model name to use.")
@@ -251,7 +251,7 @@ class ChatTessAI(BaseChatModel):
         if "tess_api_key" not in kwargs and "api_key" not in kwargs:
             import os
 
-            env_key = os.environ.get("TESS_API_KEY")
+            env_key = os.environ.get("TESSAI_API_KEY")
             if env_key:
                 kwargs["tess_api_key"] = env_key
         if "api_key" in kwargs and "tess_api_key" not in kwargs:

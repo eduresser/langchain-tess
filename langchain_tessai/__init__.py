@@ -1,7 +1,7 @@
 """LangChain integration for Tess AI."""
 
-from langchain_tess.chat_models import ChatTessAI, FileRef
-from langchain_tess.exceptions import (
+from langchain_tessai.chat_models import ChatTessAI, FileRef
+from langchain_tessai.exceptions import (
     TessAPIError,
     TessAuthenticationError,
     TessPayloadTooLargeError,
@@ -9,7 +9,7 @@ from langchain_tess.exceptions import (
     TessServerError,
     TessValidationError,
 )
-from langchain_tess.tool_calling import (
+from langchain_tessai.tool_calling import (
     IncrementalJsonContentExtractor,
     ToolCallParseError,
     parse_json_response,

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "langchain-tess"
+name = "langchain-tessai"
 version = "1.0.0"
 description = "An integration package connecting Tess AI and LangChain"
 license = { text = "MIT" }
@@ -30,8 +30,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://tess.im"
-Repository = "https://github.com/eduresser/langchain-tess"
-Issues = "https://github.com/eduresser/langchain-tess/issues"
+Repository = "https://github.com/eduresser/langchain-tessai"
+Issues = "https://github.com/eduresser/langchain-tessai/issues"
 Documentation = "https://docs.tess.im/en/api-overview"
 
 [dependency-groups]
@@ -127,7 +127,7 @@ ban-relative-imports = "all"
 omit = ["tests/*"]
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --strict-config --durations=5 --cov=langchain_tess"
+addopts = "--strict-markers --strict-config --durations=5 --cov=langchain_tessai"
 markers = [
     "requires: mark tests as requiring a specific library",
     "scheduled: mark tests to run in scheduled testing",

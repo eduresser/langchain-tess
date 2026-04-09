@@ -593,7 +593,7 @@ wheels = [
 ]
 
 [[package]]
-name = "langchain-tess"
+name = "langchain-tessai"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
