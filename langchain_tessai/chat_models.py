@@ -1067,7 +1067,6 @@ class ChatTessAI(BaseChatModel):
                 content = (
                     f'[Command Result] The command "{tool_name}" returned:\n'
                     f"{ChatTessAI._content_to_str(msg.content)}\n\n"
-                    f'[Respond with a JSON object: {{"content": "your response"}}]'
                 )
             else:
                 role, content = "user", ChatTessAI._content_to_str(msg.content)
@@ -1169,7 +1168,6 @@ class ChatTessAI(BaseChatModel):
                 content = (
                     f'[Command Result] The command "{tool_name}" returned:\n'
                     f"{ChatTessAI._content_to_str(msg.content)}\n\n"
-                    f'[Respond with a JSON object: {{"content": "your response"}}]'
                 )
             else:
                 role, content = "user", ChatTessAI._content_to_str(msg.content)
