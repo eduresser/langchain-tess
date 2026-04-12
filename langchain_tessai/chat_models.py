@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -45,18 +46,22 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, ValidationError
 
 from langchain_tessai.exceptions import (
     TessAPIError,
     TessAuthenticationError,
     TessPayloadTooLargeError,
     TessRateLimitError,
+    TessServerError,
     raise_for_tess_status,
 )
 from langchain_tessai.tool_calling import (
+    JSON_REMINDER_NO_TOOLS,
+    JSON_REMINDER_WITH_TOOLS,
     IncrementalJsonContentExtractor,
     ToolCallParseError,
+    _get_trailing_content,
     build_json_prompt,
     has_trailing_content,
     parse_json_response,
@@ -64,6 +69,27 @@ from langchain_tessai.tool_calling import (
 
 
 logger = logging.getLogger(__name__)
+
+_log_level = os.environ.get("LANGCHAIN_TESSAI_LOG_LEVEL", "").upper()
+if _log_level and hasattr(logging, _log_level):
+    logger.setLevel(getattr(logging, _log_level))
+
+_RESPOND_TEXT_KEYS = ("text", "message", "content", "response", "answer", "reply")
+
+
+def _extract_text_from_args(args: Dict[str, Any]) -> str:
+    """Best-effort extraction of a text payload from hallucinated command args.
+
+    Models that hallucinate a ``respond`` / ``reply`` / ``answer`` command
+    typically put the actual response in an argument like ``text`` or
+    ``message``.  This function returns the first string value found
+    under one of those well-known keys, or the empty string.
+    """
+    for key in _RESPOND_TEXT_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
 
 
 MIME_TO_EXTENSION: Dict[str, str] = {
@@ -222,6 +248,22 @@ class ChatTessAI(BaseChatModel):
         default=5.0,
         description="Seconds between polling requests when the API returns before completion.",
     )
+    max_poll_attempts: int = Field(
+        default=120,
+        description=(
+            "Maximum number of polling attempts when wait_execution=False. "
+            "At the default polling_interval of 5s, 120 attempts = 10-minute deadline. "
+            "Raises TimeoutError when exceeded."
+        ),
+    )
+    max_file_poll_attempts: int = Field(
+        default=60,
+        description=(
+            "Maximum number of polling attempts for file processing. "
+            "At the default polling_interval of 5s, 60 attempts = 5-minute deadline. "
+            "Raises TimeoutError when exceeded."
+        ),
+    )
     file_ids: Optional[List[int]] = Field(
         default=None, description="File IDs to attach to the execution."
     )
@@ -302,30 +344,34 @@ class ChatTessAI(BaseChatModel):
     ) -> None:
         """Update the conversation cache after a successful API response.
 
-        When *raw_output* contains **trailing content** after the first
-        balanced JSON (i.e. the model hallucinated), caching is skipped
-        entirely.  On the next turn :meth:`_find_conversation` will find
-        no matching prefix, forcing a fresh conversation that keeps the
-        Tess-side history free of hallucinated text.
+        The cache always uses the *canonical* (re-serialised) form of the
+        parsed assistant message, so trivial formatting differences
+        between the model's raw output and Python's :func:`json.dumps`
+        do not break continuation.
 
-        When the raw output is clean (no trailing content) or not
-        provided, the canonical form is used for hashing so that
-        trivial JSON-formatting differences between the model's output
-        and Python's :func:`json.dumps` do not break continuation.
+        Even when the raw output contains trailing content (the model
+        hallucinated extra text after the first JSON object), we still
+        cache the conversation: the parser already extracted only the
+        first valid JSON, so the canonical form is clean.  Skipping the
+        cache would force a brand-new Tess conversation on the next
+        turn, losing server-side context and worsening hallucinations.
         """
         if not self.track_conversations:
             return
         new_root_id = metadata.get("tess_root_id")
         if new_root_id is None:
             return
-        if raw_output is not None and has_trailing_content(raw_output):
-            return
+        _had_trailing = raw_output is not None and has_trailing_content(raw_output)
         response_msg = {
             "role": "assistant",
             "content": self._assistant_message_to_tess_content(assistant_msg),
         }
         full_conversation = converted + [response_msg]
         self._update_conversation_cache(full_conversation, new_root_id)
+        logger.debug(
+            "Conversation cache updated: root_id=%s n_messages=%d had_trailing=%s",
+            new_root_id, len(full_conversation), _had_trailing,
+        )
 
     def _invalidate_root_id(self, root_id: int) -> None:
         """Remove all cache entries associated with *root_id*."""
@@ -337,7 +383,8 @@ class ChatTessAI(BaseChatModel):
             ]
             for h in to_remove:
                 del self._conversation_cache[h]
-                self._cache_order.remove(h)
+                if h in self._cache_order:
+                    self._cache_order.remove(h)
 
     def reset_conversations(self) -> None:
         """Clear the internal conversation cache."""
@@ -421,7 +468,19 @@ class ChatTessAI(BaseChatModel):
                     return None
                 for tc in msg.tool_calls:
                     if tc["name"] == tool_name:
-                        parsed = schema(**tc["args"])
+                        try:
+                            parsed = schema(**tc["args"])
+                        except (ValidationError, TypeError, KeyError) as exc:
+                            if include_raw:
+                                return {
+                                    "raw": msg,
+                                    "parsed": None,
+                                    "parsing_error": exc,
+                                }
+                            raise ValueError(
+                                f"Failed to parse structured output into "
+                                f"{schema.__name__}: {exc}"
+                            ) from exc
                         if include_raw:
                             return {
                                 "raw": msg,
@@ -508,6 +567,7 @@ class ChatTessAI(BaseChatModel):
                 stream=False,
                 root_id=continuation_root_id,
                 file_ids=merged_file_ids,
+                bound_tools=bound_tools,
                 **kwargs,
             )
 
@@ -521,7 +581,8 @@ class ChatTessAI(BaseChatModel):
                 self._invalidate_root_id(continuation_root_id)
                 continuation_root_id = None
                 payload = self._build_payload_from_converted(
-                    converted, stream=False, file_ids=merged_file_ids, **kwargs
+                    converted, stream=False, file_ids=merged_file_ids,
+                    bound_tools=bound_tools, **kwargs,
                 )
 
             for attempt in range(self.max_retries + 1):
@@ -533,7 +594,7 @@ class ChatTessAI(BaseChatModel):
                     last_error = exc
                     _discard_continuation()
                     if attempt < self.max_retries:
-                        time.sleep(exc.retry_after)
+                        time.sleep(max(1, exc.retry_after))
                     continue
                 except (
                     TessAPIError,
@@ -561,6 +622,40 @@ class ChatTessAI(BaseChatModel):
                 except ToolCallParseError as exc:
                     last_error = exc
                     last_output = exc.raw_output
+                    _discard_continuation()
+                    if attempt < self.max_retries:
+                        time.sleep(min(2**attempt, 8))
+                    continue
+
+                if (
+                    tool_choice in ("required", "any", True)
+                    and bound_tools
+                    and not msg.tool_calls
+                ):
+                    last_error = ToolCallParseError(
+                        "tool_choice='required' but model returned no tool calls",
+                        raw_output=output,
+                    )
+                    last_output = output
+                    _discard_continuation()
+                    if attempt < self.max_retries:
+                        time.sleep(min(2**attempt, 8))
+                    continue
+
+                if (
+                    msg.response_metadata.get("_all_tools_hallucinated")
+                    and bound_tools
+                ):
+                    logger.warning(
+                        "All tool calls were hallucinated (attempt %d); "
+                        "retrying with new root_id",
+                        attempt + 1,
+                    )
+                    last_error = ToolCallParseError(
+                        "All tool calls were hallucinated",
+                        raw_output=output,
+                    )
+                    last_output = output
                     _discard_continuation()
                     if attempt < self.max_retries:
                         time.sleep(min(2**attempt, 8))
@@ -623,6 +718,7 @@ class ChatTessAI(BaseChatModel):
                 stream=False,
                 root_id=continuation_root_id,
                 file_ids=merged_file_ids,
+                bound_tools=bound_tools,
                 **kwargs,
             )
 
@@ -636,7 +732,8 @@ class ChatTessAI(BaseChatModel):
                 self._invalidate_root_id(continuation_root_id)
                 continuation_root_id = None
                 payload = self._build_payload_from_converted(
-                    converted, stream=False, file_ids=merged_file_ids, **kwargs
+                    converted, stream=False, file_ids=merged_file_ids,
+                    bound_tools=bound_tools, **kwargs,
                 )
 
             for attempt in range(self.max_retries + 1):
@@ -648,7 +745,7 @@ class ChatTessAI(BaseChatModel):
                     last_error = exc
                     _discard_continuation()
                     if attempt < self.max_retries:
-                        await asyncio.sleep(exc.retry_after)
+                        await asyncio.sleep(max(1, exc.retry_after))
                     continue
                 except (
                     TessAPIError,
@@ -676,6 +773,40 @@ class ChatTessAI(BaseChatModel):
                 except ToolCallParseError as exc:
                     last_error = exc
                     last_output = exc.raw_output
+                    _discard_continuation()
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(min(2**attempt, 8))
+                    continue
+
+                if (
+                    tool_choice in ("required", "any", True)
+                    and bound_tools
+                    and not msg.tool_calls
+                ):
+                    last_error = ToolCallParseError(
+                        "tool_choice='required' but model returned no tool calls",
+                        raw_output=output,
+                    )
+                    last_output = output
+                    _discard_continuation()
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(min(2**attempt, 8))
+                    continue
+
+                if (
+                    msg.response_metadata.get("_all_tools_hallucinated")
+                    and bound_tools
+                ):
+                    logger.warning(
+                        "All tool calls were hallucinated (attempt %d); "
+                        "retrying with new root_id",
+                        attempt + 1,
+                    )
+                    last_error = ToolCallParseError(
+                        "All tool calls were hallucinated",
+                        raw_output=output,
+                    )
+                    last_output = output
                     _discard_continuation()
                     if attempt < self.max_retries:
                         await asyncio.sleep(min(2**attempt, 8))
@@ -758,18 +889,94 @@ class ChatTessAI(BaseChatModel):
         """Build the final ``AIMessage`` from raw API *output*.
 
         Always parses the response as JSON (JSON-only protocol).
-        ``bound_tools`` is kept for signature compatibility but the
-        parsing path is the same regardless.
+        When *bound_tools* is provided, any commands whose name does not
+        match a known tool are treated as hallucinations and stripped.
+        If a hallucinated command carries text (e.g. a ``"respond"``
+        command with a ``text`` argument), that text is folded back into
+        the ``content`` field so no information is lost.
+
+        When the model produces a JSON wrapper with short content followed
+        by a substantial trailing text (e.g. a full report in markdown),
+        and there are no tool calls, the trailing text is the actual
+        response and is folded into ``content``.
         """
         content, tool_calls = parse_json_response(output)
         content = self._apply_stop_sequences(content, stop)
+
+        had_tool_calls = bool(tool_calls)
+        if tool_calls:
+            tool_calls, content = self._filter_hallucinated_commands(
+                tool_calls, content, bound_tools,
+            )
+        all_tools_hallucinated = had_tool_calls and not tool_calls
+
+        if not tool_calls:
+            trailing = _get_trailing_content(output)
+            if trailing:
+                content = f"{content}\n\n{trailing}".strip() if content.strip() else trailing
+                logger.debug("Trailing content folded into response: %d extra chars", len(trailing))
+
         if tool_calls:
             return AIMessage(
                 content=content,
                 tool_calls=tool_calls,
-                response_metadata=metadata,
+                response_metadata={**metadata, "finish_reason": "tool_calls"},
             )
-        return AIMessage(content=content, response_metadata=metadata)
+        resp_meta = {**metadata, "finish_reason": "stop"}
+        if all_tools_hallucinated:
+            resp_meta["_all_tools_hallucinated"] = True
+        return AIMessage(content=content, response_metadata=resp_meta)
+
+    @staticmethod
+    def _filter_hallucinated_commands(
+        tool_calls: List[dict],
+        content: str,
+        bound_tools: Optional[List[dict]],
+    ) -> Tuple[Optional[List[dict]], str]:
+        """Remove commands that don't match any bound tool.
+
+        When a hallucinated command carries text content (common with
+        ``"respond"``, ``"reply"``, ``"answer"`` style hallucinations),
+        the text is extracted and appended to *content*.
+
+        Returns ``(filtered_tool_calls_or_None, updated_content)``.
+        """
+        if not bound_tools:
+            return None, content
+
+        known_names = {
+            t.get("function", t).get("name", "") for t in bound_tools
+        }
+        known_names.discard("")
+
+        valid: list[dict] = []
+        rescued_text_parts: list[str] = []
+
+        for tc in tool_calls:
+            if tc["name"] in known_names:
+                valid.append(tc)
+            else:
+                text = _extract_text_from_args(tc.get("args", {}))
+                if text:
+                    rescued_text_parts.append(text)
+                logger.debug(
+                    "Dropped hallucinated command %r (not in %s)",
+                    tc["name"],
+                    known_names,
+                )
+
+        if rescued_text_parts:
+            extra = "\n\n".join(rescued_text_parts)
+            content = f"{content}\n\n{extra}".strip() if content.strip() else extra
+
+        dropped = [tc for tc in tool_calls if tc["name"] not in known_names]
+        if dropped:
+            logger.debug(
+                "Dropped %d hallucinated command(s): %s (known: %s)",
+                len(dropped), [tc["name"] for tc in dropped], list(known_names),
+            )
+
+        return (valid or None), content
 
     # ------------------------------------------------------------------
     # Core: synchronous streaming
@@ -820,6 +1027,11 @@ class ChatTessAI(BaseChatModel):
         extractor = IncrementalJsonContentExtractor()
         last_metadata: dict = {}
 
+        logger.debug(
+            "astream: n_messages=%d bound_tools=%s",
+            len(messages), [t.get("function", t).get("name", "") for t in (bound_tools or [])],
+        )
+
         try:
             async with self._async_client() as client:
                 dynamic_file_ids = (
@@ -844,7 +1056,13 @@ class ChatTessAI(BaseChatModel):
                     stream=True,
                     root_id=root_id,
                     file_ids=merged_file_ids,
+                    bound_tools=bound_tools,
                     **kwargs,
+                )
+                logger.debug(
+                    "TESS STREAM REQUEST: POST %s\n--- request body ---\n%s\n--- end request body ---",
+                    self._execute_url,
+                    self._format_payload_for_debug(payload),
                 )
                 async with client.stream(
                     "POST",
@@ -860,7 +1078,11 @@ class ChatTessAI(BaseChatModel):
                         if chunk_gen.message.response_metadata:
                             last_metadata = chunk_gen.message.response_metadata
                         new_content = extractor.feed(chunk_gen.message.content)
-                        if new_content:
+                        # Do NOT yield raw-passthrough chunks: when the extractor
+                        # enters passthrough mode it streams the raw JSON wrapper
+                        # (e.g. '{"content": "…"}') which is not valid Markdown.
+                        # The final chunk below will deliver the fully-parsed content.
+                        if new_content and not extractor.is_passthrough:
                             content_chunk = ChatGenerationChunk(
                                 message=AIMessageChunk(content=new_content)
                             )
@@ -869,10 +1091,13 @@ class ChatTessAI(BaseChatModel):
                                     new_content, chunk=content_chunk
                                 )
                             yield content_chunk
-        except (httpx.HTTPStatusError, httpx.TransportError):
+        except (httpx.HTTPStatusError, httpx.TransportError) as _stream_exc:
+            logger.warning("SSE stream failed, falling back to agenerate: %s", _stream_exc)
             kwargs_for_gen = dict(kwargs)
             if bound_tools is not None:
                 kwargs_for_gen["tools"] = bound_tools
+            if tool_choice is not None:
+                kwargs_for_gen["tool_choice"] = tool_choice
             result = await self._agenerate(
                 messages, stop=stop, run_manager=run_manager, **kwargs_for_gen
             )
@@ -889,15 +1114,69 @@ class ChatTessAI(BaseChatModel):
             return
 
         full_text = extractor.get_full_text()
+        logger.debug(
+            "astream raw output: len=%d trailing=%s metadata=%s",
+            len(full_text), has_trailing_content(full_text), last_metadata,
+        )
+
         try:
             gen_msg = self._output_to_assistant_message(
                 full_text, bound_tools, last_metadata, stop=stop
             )
-        except ToolCallParseError:
-            content = extractor.get_extracted_content() or full_text
-            content = self._apply_stop_sequences(content, stop)
-            meta = {**last_metadata, "tess_parse_degraded": True}
-            gen_msg = AIMessage(content=content, response_metadata=meta)
+        except ToolCallParseError as _parse_exc:
+            logger.warning("astream parse error: %s", _parse_exc)
+            kwargs_for_gen = dict(kwargs)
+            if bound_tools is not None:
+                kwargs_for_gen["tools"] = bound_tools
+            if tool_choice is not None:
+                kwargs_for_gen["tool_choice"] = tool_choice
+            result = await self._agenerate(
+                messages, stop=stop, run_manager=run_manager, **kwargs_for_gen
+            )
+            gen_msg = result.generations[0].message
+            chunk = ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=gen_msg.content,
+                    tool_calls=getattr(gen_msg, "tool_calls", None) or [],
+                    response_metadata=gen_msg.response_metadata or {},
+                    usage_metadata=getattr(gen_msg, "usage_metadata", None),
+                )
+            )
+            yield chunk
+            return
+
+        logger.debug(
+            "astream parsed: content_len=%d n_tool_calls=%d",
+            len(gen_msg.content), len(gen_msg.tool_calls) if gen_msg.tool_calls else 0,
+        )
+
+        if (
+            gen_msg.response_metadata.get("_all_tools_hallucinated")
+            and bound_tools
+        ):
+            logger.warning(
+                "All tool calls were hallucinated in astream; "
+                "falling back to agenerate with new root_id"
+            )
+            kwargs_for_gen = dict(kwargs)
+            if bound_tools is not None:
+                kwargs_for_gen["tools"] = bound_tools
+            if tool_choice is not None:
+                kwargs_for_gen["tool_choice"] = tool_choice
+            result = await self._agenerate(
+                messages, stop=stop, run_manager=run_manager, **kwargs_for_gen
+            )
+            gen_msg = result.generations[0].message
+            chunk = ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=gen_msg.content,
+                    tool_calls=getattr(gen_msg, "tool_calls", None) or [],
+                    response_metadata=gen_msg.response_metadata or {},
+                    usage_metadata=getattr(gen_msg, "usage_metadata", None),
+                )
+            )
+            yield chunk
+            return
 
         self._track_after_response(
             converted, gen_msg, last_metadata, raw_output=full_text,
@@ -914,10 +1193,55 @@ class ChatTessAI(BaseChatModel):
             "total_tokens": input_tokens + output_tokens,
         }
 
+        # Compute how much of the final content was already streamed so we can
+        # avoid duplicating it in the final chunk.
+        #
+        # • content_complete=True + is_passthrough: passthrough mode was active,
+        #   so the raw JSON was suppressed (not yielded above). Nothing was sent
+        #   to the caller yet → remaining = full parsed content.
+        # • content_complete=True (normal extraction): the JSON "content" field
+        #   was streamed char-by-char. Remaining = anything extra (e.g. trailing
+        #   content folded in by _output_to_assistant_message).
+        # • content_complete=False: stream ended before the content string closed
+        #   (rare / malformed JSON). Fall back to _agenerate handled above;
+        #   if we reach here anyway, remaining = full content.
+        already_streamed = (
+            extractor.get_extracted_content()
+            if extractor.content_complete and not extractor.is_passthrough
+            else ""
+        )
+        final_content = gen_msg.content
+
+        if already_streamed and final_content.startswith(already_streamed):
+            remaining = final_content[len(already_streamed):]
+        elif already_streamed:
+            # Decoded content from the extractor and from json.loads diverged
+            # (e.g. surrogate-pair or normalization difference). Avoid sending
+            # the full content again — the caller already received something
+            # close enough during streaming.
+            logger.warning(
+                "astream content mismatch: streamed_len=%d final_len=%d "
+                "(streamed prefix not found in final_content)",
+                len(already_streamed), len(final_content),
+            )
+            remaining = ""
+        else:
+            remaining = final_content
+
+        if remaining:
+            logger.debug(
+                "Extra content in final chunk: streamed=%d total=%d remaining=%d",
+                len(already_streamed), len(final_content), len(remaining),
+            )
+
+        tc = getattr(gen_msg, "tool_calls", None) or []
         final_chunk = ChatGenerationChunk(
             message=AIMessageChunk(
-                content="" if extractor.content_complete else gen_msg.content,
-                tool_calls=getattr(gen_msg, "tool_calls", None) or [],
+                content=remaining,
+                # Only propagate tool_calls when non-empty. An explicit empty
+                # list can cause some Agent Chat UI versions to render the
+                # message as a function-call block rather than plain text.
+                **({"tool_calls": tc} if tc else {}),
                 response_metadata=gen_msg.response_metadata or {},
                 usage_metadata=stream_usage,
             )
@@ -951,13 +1275,34 @@ class ChatTessAI(BaseChatModel):
 
         if messages and isinstance(messages[0], SystemMessage):
             combined = f"{json_prompt}\n\n{messages[0].content}"
-            return [SystemMessage(content=combined)] + list(messages[1:])
+            result_msgs = [SystemMessage(content=combined)] + list(messages[1:])
+        else:
+            result_msgs = [SystemMessage(content=json_prompt)] + list(messages)
 
-        return [SystemMessage(content=json_prompt)] + list(messages)
+        return result_msgs
 
     # ------------------------------------------------------------------
     # Execute helpers (single attempt, no retry)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_payload_for_debug(payload: dict) -> str:
+        """Return a debug-friendly representation of the Tess request payload.
+
+        When a ``root_id`` is present (conversation continuation) only the
+        messages delta is shown.  On a fresh conversation the full payload is
+        dumped so all parameters are visible.
+        """
+        if payload.get("root_id") is not None:
+            delta = {
+                "root_id": payload["root_id"],
+                "messages": payload.get("messages", []),
+                "stream": payload.get("stream"),
+            }
+            if payload.get("file_ids"):
+                delta["file_ids"] = payload["file_ids"]
+            return json.dumps(delta, ensure_ascii=False, indent=2, default=str)
+        return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
     @staticmethod
     def _safe_json_body(resp: httpx.Response) -> dict | None:
@@ -975,8 +1320,18 @@ class ChatTessAI(BaseChatModel):
         Returns ``(output_text, metadata_dict)``.
         Raises typed :class:`TessAPIError` subclasses for HTTP errors.
         """
+        logger.debug(
+            "TESS REQUEST: POST %s\n--- request body ---\n%s\n--- end request body ---",
+            self._execute_url,
+            self._format_payload_for_debug(payload),
+        )
         resp = client.post(
             self._execute_url, json=payload, headers=self._headers
+        )
+        logger.debug(
+            "TESS RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+            resp.status_code,
+            resp.text,
         )
         if resp.status_code >= 400:
             raise_for_tess_status(resp.status_code, self._safe_json_body(resp))
@@ -992,29 +1347,19 @@ class ChatTessAI(BaseChatModel):
     async def _execute_async(
         self, client: httpx.AsyncClient, payload: dict
     ) -> tuple[str, dict]:
-        msgs = payload.get("messages", [])
-        msg_summary = []
-        for m in msgs:
-            role = m.get("role", "?")
-            content = m.get("content", "")
-            msg_summary.append(
-                f"  [{role}] len={len(content)}"
-                + (f" content={content!r}" if role != "developer" else "")
-            )
         logger.debug(
-            "TESS REQUEST: url=%s model=%s temp=%s tools=%s "
-            "wait_exec=%s n_msgs=%d\n%s",
+            "TESS REQUEST: POST %s\n--- request body ---\n%s\n--- end request body ---",
             self._execute_url,
-            payload.get("model"),
-            payload.get("temperature"),
-            payload.get("tools"),
-            payload.get("wait_execution"),
-            len(msgs),
-            "\n".join(msg_summary),
+            self._format_payload_for_debug(payload),
         )
 
         resp = await client.post(
             self._execute_url, json=payload, headers=self._headers
+        )
+        logger.debug(
+            "TESS RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+            resp.status_code,
+            resp.text,
         )
         if resp.status_code >= 400:
             body = self._safe_json_body(resp)
@@ -1065,10 +1410,16 @@ class ChatTessAI(BaseChatModel):
                 tool_name = getattr(msg, "name", None) or "unknown_tool"
                 role = "user"
                 content = (
-                    f'[Command Result] The command "{tool_name}" returned:\n'
-                    f"{ChatTessAI._content_to_str(msg.content)}\n\n"
+                    f'--- [Command Result: "{tool_name}"] ---\n'
+                    f"{ChatTessAI._content_to_str(msg.content)}\n"
+                    f"--- [End Result: \"{tool_name}\"] ---"
                 )
             else:
+                logger.warning(
+                    "Unknown message type %s; treating as 'user' role. "
+                    "This may produce unexpected behavior.",
+                    type(msg).__name__,
+                )
                 role, content = "user", ChatTessAI._content_to_str(msg.content)
 
             if converted and converted[-1]["role"] == role and role != "developer":
@@ -1166,8 +1517,9 @@ class ChatTessAI(BaseChatModel):
                 tool_name = getattr(msg, "name", None) or "unknown_tool"
                 role = "user"
                 content = (
-                    f'[Command Result] The command "{tool_name}" returned:\n'
-                    f"{ChatTessAI._content_to_str(msg.content)}\n\n"
+                    f'--- [Command Result: "{tool_name}"] ---\n'
+                    f"{ChatTessAI._content_to_str(msg.content)}\n"
+                    f"--- [End Result: \"{tool_name}\"] ---"
                 )
             else:
                 role, content = "user", ChatTessAI._content_to_str(msg.content)
@@ -1176,6 +1528,12 @@ class ChatTessAI(BaseChatModel):
                 converted[-1]["content"] += f"\n\n{content}"
             else:
                 converted.append({"role": role, "content": content})
+
+        if any(isinstance(m, ToolMessage) for m in messages):
+            logger.debug(
+                "Messages converted: %d messages -> %d tess messages, roles=%s",
+                len(messages), len(converted), [m["role"] for m in converted],
+            )
 
         return converted, all_file_refs
 
@@ -1209,6 +1567,30 @@ class ChatTessAI(BaseChatModel):
             self._convert_messages(messages), stream=stream, **kwargs
         )
 
+    @staticmethod
+    def _append_json_reminder(
+        messages: List[dict],
+        has_tools: bool,
+    ) -> List[dict]:
+        """Append a compact JSON-format reminder to every user message.
+
+        This reinforces the JSON-only protocol throughout the entire
+        conversation, preventing format drift in long multi-turn
+        dialogues.  Touches ``user`` and ``developer`` messages to
+        keep the instruction visible at every turn.
+        """
+        if not messages:
+            return messages
+        reminder = JSON_REMINDER_WITH_TOOLS if has_tools else JSON_REMINDER_NO_TOOLS
+        result = list(messages)
+        for i, msg in enumerate(result):
+            if msg["role"] in ("user", "developer"):
+                result[i] = {
+                    **msg,
+                    "content": msg["content"] + reminder,
+                }
+        return result
+
     def _build_payload_from_converted(
         self,
         converted_messages: List[dict],
@@ -1216,8 +1598,12 @@ class ChatTessAI(BaseChatModel):
         stream: bool = False,
         root_id: Optional[int] = None,
         file_ids: Optional[List[int]] = None,
+        bound_tools: Optional[List[dict]] = None,
         **kwargs: Any,
     ) -> dict:
+        converted_messages = self._append_json_reminder(
+            converted_messages, has_tools=bool(bound_tools),
+        )
         payload: Dict[str, Any] = {
             "model": self.model,
             "temperature": f"{self.temperature:g}",
@@ -1233,6 +1619,7 @@ class ChatTessAI(BaseChatModel):
         if effective_file_ids:
             payload["file_ids"] = effective_file_ids
         payload.update(kwargs)
+
         return payload
 
     # ------------------------------------------------------------------
@@ -1268,11 +1655,20 @@ class ChatTessAI(BaseChatModel):
         Returns the Tess ``file_id``.  Raises :class:`RuntimeError` if
         processing fails.
         """
+        upload_url = f"{self.base_url}/files"
+        logger.debug(
+            "TESS FILE UPLOAD REQUEST: POST %s filename=%s size=%d",
+            upload_url, filename, len(file_bytes),
+        )
         resp = client.post(
-            f"{self.base_url}/files",
+            upload_url,
             headers=self._upload_headers,
             files={"file": (filename, file_bytes)},
             data={"process": "true"},
+        )
+        logger.debug(
+            "TESS FILE UPLOAD RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+            resp.status_code, resp.text,
         )
         resp.raise_for_status()
         file_data = resp.json()
@@ -1288,9 +1684,14 @@ class ChatTessAI(BaseChatModel):
             return file_id
 
         poll_url = f"{self.base_url}/files/{file_id}"
-        while True:
+        for _attempt in range(self.max_file_poll_attempts):
             time.sleep(self.polling_interval)
+            logger.debug("TESS FILE POLL REQUEST: GET %s (attempt %d)", poll_url, _attempt + 1)
             poll_resp = client.get(poll_url, headers=self._upload_headers)
+            logger.debug(
+                "TESS FILE POLL RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+                poll_resp.status_code, poll_resp.text,
+            )
             poll_resp.raise_for_status()
             poll_data = poll_resp.json()
             poll_status = poll_data.get("status", "")
@@ -1301,6 +1702,10 @@ class ChatTessAI(BaseChatModel):
                 raise RuntimeError(
                     f"Tess file processing failed for file_id={file_id}: {poll_data}"
                 )
+        raise TimeoutError(
+            f"Tess file processing timed out after {self.max_file_poll_attempts} "
+            f"attempts for file_id={file_id}"
+        )
 
     async def _aupload_and_process_file(
         self,
@@ -1311,11 +1716,20 @@ class ChatTessAI(BaseChatModel):
         """Async version of :meth:`_upload_and_process_file`."""
         import asyncio
 
+        upload_url = f"{self.base_url}/files"
+        logger.debug(
+            "TESS FILE UPLOAD REQUEST: POST %s filename=%s size=%d",
+            upload_url, filename, len(file_bytes),
+        )
         resp = await client.post(
-            f"{self.base_url}/files",
+            upload_url,
             headers=self._upload_headers,
             files={"file": (filename, file_bytes)},
             data={"process": "true"},
+        )
+        logger.debug(
+            "TESS FILE UPLOAD RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+            resp.status_code, resp.text,
         )
         resp.raise_for_status()
         file_data = resp.json()
@@ -1331,9 +1745,14 @@ class ChatTessAI(BaseChatModel):
             return file_id
 
         poll_url = f"{self.base_url}/files/{file_id}"
-        while True:
+        for _attempt in range(self.max_file_poll_attempts):
             await asyncio.sleep(self.polling_interval)
+            logger.debug("TESS FILE POLL REQUEST: GET %s (attempt %d)", poll_url, _attempt + 1)
             poll_resp = await client.get(poll_url, headers=self._upload_headers)
+            logger.debug(
+                "TESS FILE POLL RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+                poll_resp.status_code, poll_resp.text,
+            )
             poll_resp.raise_for_status()
             poll_data = poll_resp.json()
             poll_status = poll_data.get("status", "")
@@ -1344,6 +1763,10 @@ class ChatTessAI(BaseChatModel):
                 raise RuntimeError(
                     f"Tess file processing failed for file_id={file_id}: {poll_data}"
                 )
+        raise TimeoutError(
+            f"Tess file processing timed out after {self.max_file_poll_attempts} "
+            f"attempts for file_id={file_id}"
+        )
 
     # ------------------------------------------------------------------
     # File ID resolution
@@ -1368,7 +1791,13 @@ class ChatTessAI(BaseChatModel):
                 continue
 
             if ref.url and ref.data is None:
+                logger.debug("TESS FILE DOWNLOAD REQUEST: GET %s", ref.url)
                 dl_resp = client.get(ref.url)
+                logger.debug(
+                    "TESS FILE DOWNLOAD RESPONSE: status=%d size=%d content_type=%s",
+                    dl_resp.status_code, len(dl_resp.content),
+                    dl_resp.headers.get("content-type", "unknown"),
+                )
                 dl_resp.raise_for_status()
                 ref.data = dl_resp.content
                 if not ref.mime_type:
@@ -1409,7 +1838,13 @@ class ChatTessAI(BaseChatModel):
                 continue
 
             if ref.url and ref.data is None:
+                logger.debug("TESS FILE DOWNLOAD REQUEST: GET %s", ref.url)
                 dl_resp = await client.get(ref.url)
+                logger.debug(
+                    "TESS FILE DOWNLOAD RESPONSE: status=%d size=%d content_type=%s",
+                    dl_resp.status_code, len(dl_resp.content),
+                    dl_resp.headers.get("content-type", "unknown"),
+                )
                 dl_resp.raise_for_status()
                 ref.data = dl_resp.content
                 if not ref.mime_type:
@@ -1464,23 +1899,40 @@ class ChatTessAI(BaseChatModel):
     def _extract_response_id(data: dict) -> int:
         responses = data.get("responses", [])
         if responses:
-            return responses[0]["id"]
+            response_id = responses[0].get("id")
+            if response_id is None:
+                raise ValueError(
+                    f"Response entry missing 'id' field in API response: {data}"
+                )
+            return response_id
         raise ValueError(f"No response id found in API response: {data}")
 
     def _poll_for_result(self, client: httpx.Client, response_id: int) -> dict:
         url = self._response_url(response_id)
-        while True:
+        for _attempt in range(self.max_poll_attempts):
+            logger.debug("TESS POLL REQUEST: GET %s (attempt %d)", url, _attempt + 1)
             resp = client.get(url, headers=self._headers)
             resp.raise_for_status()
             data = resp.json()
+            logger.debug(
+                "TESS POLL RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+                resp.status_code,
+                resp.text,
+            )
             if data.get("status") in self._TERMINAL_STATUSES:
                 if data.get("status") in ("failed", "error"):
-                    raise RuntimeError(
+                    raise TessServerError(
                         f"Tess AI execution failed: "
-                        f"{data.get('error', 'unknown error')}"
+                        f"{data.get('error', 'unknown error')}",
+                        status_code=500,
                     )
                 return data
             time.sleep(self.polling_interval)
+        raise TimeoutError(
+            f"Tess AI execution timed out after {self.max_poll_attempts} "
+            f"polling attempts "
+            f"({self.max_poll_attempts * self.polling_interval:.0f}s)"
+        )
 
     async def _apoll_for_result(
         self, client: httpx.AsyncClient, response_id: int
@@ -1488,18 +1940,30 @@ class ChatTessAI(BaseChatModel):
         import asyncio
 
         url = self._response_url(response_id)
-        while True:
+        for _attempt in range(self.max_poll_attempts):
+            logger.debug("TESS POLL REQUEST: GET %s (attempt %d)", url, _attempt + 1)
             resp = await client.get(url, headers=self._headers)
             resp.raise_for_status()
             data = resp.json()
+            logger.debug(
+                "TESS POLL RESPONSE: status=%d\n--- response body ---\n%s\n--- end response body ---",
+                resp.status_code,
+                resp.text,
+            )
             if data.get("status") in self._TERMINAL_STATUSES:
                 if data.get("status") in ("failed", "error"):
-                    raise RuntimeError(
+                    raise TessServerError(
                         f"Tess AI execution failed: "
-                        f"{data.get('error', 'unknown error')}"
+                        f"{data.get('error', 'unknown error')}",
+                        status_code=500,
                     )
                 return data
             await asyncio.sleep(self.polling_interval)
+        raise TimeoutError(
+            f"Tess AI execution timed out after {self.max_poll_attempts} "
+            f"polling attempts "
+            f"({self.max_poll_attempts * self.polling_interval:.0f}s)"
+        )
 
     # ------------------------------------------------------------------
     # Response extraction

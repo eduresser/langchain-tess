@@ -928,3 +928,83 @@ class TestBuildJsonPromptWithToolChoice:
     def test_prompt_without_tools_ignores_tool_choice(self) -> None:
         prompt = build_json_prompt(None, tool_choice="required")
         assert "MUST call" not in prompt
+
+
+# ==================================================================
+# New tests for edge-case containment fixes
+# ==================================================================
+
+
+# ------------------------------------------------------------------
+# Fix 6: \u Unicode escape at SSE chunk boundary
+# ------------------------------------------------------------------
+
+class TestUnicodeEscapeAtChunkBoundary:
+    def test_unicode_split_before_last_two_hex_digits(self) -> None:
+        """\\uXXXX split so that only first 2 hex digits arrive in first chunk."""
+        ext = IncrementalJsonContentExtractor()
+        # \u00e9 = é; split after \u00
+        part1 = '{"content": "caf\\u00'
+        part2 = 'e9"}'
+        r1 = ext.feed(part1)
+        r2 = ext.feed(part2)
+        assert r1 + r2 == "café", f"Expected 'café', got {(r1 + r2)!r}"
+
+    def test_unicode_split_after_backslash_only(self) -> None:
+        """Backslash arrives alone; \\uXXXX completes in next chunk."""
+        ext = IncrementalJsonContentExtractor()
+        # end first chunk right at the backslash
+        part1 = '{"content": "test\\'
+        part2 = 'u0041end"}'  # \u0041 = 'A'
+        r1 = ext.feed(part1)
+        r2 = ext.feed(part2)
+        assert r1 + r2 == "testAend", f"Expected 'testAend', got {(r1 + r2)!r}"
+
+    def test_unicode_in_single_chunk_unaffected(self) -> None:
+        """Full \\uXXXX in one chunk still works correctly."""
+        ext = IncrementalJsonContentExtractor()
+        result = ext.feed('{"content": "\\u00e9"}')
+        assert result == "é"
+
+    def test_unicode_split_so_u_not_yet_arrived(self) -> None:
+        """Chunk ends right before 'u' in \\u — so escape char arrives next chunk."""
+        ext = IncrementalJsonContentExtractor()
+        # end after \ but before 'u'
+        # This is handled by the existing _escape_next logic across feed() calls.
+        part1 = '{"content": "a\\'
+        part2 = 'u0042b"}'  # \u0042 = 'B'
+        r1 = ext.feed(part1)
+        r2 = ext.feed(part2)
+        assert r1 + r2 == "aBb", f"Expected 'aBb', got {(r1 + r2)!r}"
+
+
+# ------------------------------------------------------------------
+# Fix 13: content non-string after deep_parse_json
+# ------------------------------------------------------------------
+
+class TestContentDictAfterDeepParse:
+    def test_content_dict_serialized_to_json_string(self) -> None:
+        """When content is stringified JSON, deep_parse turns it into a dict.
+        parse_json_response must re-serialize it instead of raising."""
+        import json as _json
+        raw = _json.dumps({"content": '{"key": "value", "num": 42}'})
+        content, tc = parse_json_response(raw)
+        assert isinstance(content, str), "content must always be a string"
+        reparsed = _json.loads(content)
+        assert reparsed == {"key": "value", "num": 42}
+        assert tc is None
+
+    def test_content_list_serialized_to_json_string(self) -> None:
+        """Same treatment for a list content (deep_parse_json can produce lists)."""
+        import json as _json
+        raw = _json.dumps({"content": '["a", "b", "c"]'})
+        content, tc = parse_json_response(raw)
+        assert isinstance(content, str)
+        reparsed = _json.loads(content)
+        assert reparsed == ["a", "b", "c"]
+
+    def test_integer_content_still_raises(self) -> None:
+        """A literal integer content field (not dict/list) still raises ToolCallParseError."""
+        raw = '{"content": 42}'
+        with pytest.raises(ToolCallParseError, match="content.*string"):
+            parse_json_response(raw)

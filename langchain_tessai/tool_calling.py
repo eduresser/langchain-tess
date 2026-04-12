@@ -26,6 +26,17 @@ from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 
+JSON_REMINDER_WITH_TOOLS = (
+    '\n\n[ONE JSON ONLY] {"content": "full response here in markdown format", "commands": [...]}'
+    " — put your ENTIRE answer in content, no text outside the JSON."
+)
+
+JSON_REMINDER_NO_TOOLS = (
+    '\n\n[ONE JSON ONLY] {"content": "full response here in markdown format"}'
+    " — put your ENTIRE answer in content."
+)
+
+
 class ToolCallParseError(ValueError):
     """Raised when the model response cannot be parsed as valid JSON.
 
@@ -64,19 +75,22 @@ You must ALWAYS respond with a single valid JSON object and nothing else.
 When you need to execute one or more commands:
 {{"content": "optional short explanation", "commands": [{{"name": "command_name", "arguments": {{"arg1": "value1"}}}}]}}
 
-When you do NOT need to execute any command:
-{{"content": "your response text"}}
+When you do NOT need to execute any command (i.e. you already have the answer):
+{{"content": "your FULL and COMPLETE response here — put ALL text inside this field, including reports, analyses, tables, markdown, etc."}}
 
 Rules:
 - Your entire response MUST be exactly one JSON object.
-- The "content" field is REQUIRED and must be a string.
-- The "commands" field is OPTIONAL. Include it ONLY when you need to execute commands.
+- The "content" field is REQUIRED and must be a string. It supports VERY long text — put your entire response inside it, no matter how long (reports, analyses, tables, etc.).
+- The "commands" field is OPTIONAL. Include it ONLY when you need to execute one of the commands listed above.
+- The ONLY valid command names are the ones listed above. Do NOT invent or fabricate commands such as "respond", "reply", "answer", "fetch", "browse", or any other name not listed above.
+- When you have the final answer, write your COMPLETE response inside "content". Do NOT create a command to deliver your answer — put everything in "content".
 - Each command must have "name" (exactly matching a command name above) and \
 "arguments" (a JSON object matching the command's parameter schema).
 - You may execute multiple commands at once by adding multiple entries to the "commands" array.
 - Do NOT write any text, markdown, or explanation outside the JSON object.
 - Do NOT wrap the JSON in code fences or backticks.
-- Do NOT simulate or imagine command results. Stop after emitting the JSON object and wait."""
+- Do NOT simulate or imagine command results. You will receive results in the next message.
+- NEVER generate more than one JSON object."""
 
 
 # ------------------------------------------------------------------
@@ -232,15 +246,8 @@ def _find_balanced_end(text: str, start: int, open_ch: str, close_ch: str) -> in
     return -1
 
 
-def has_trailing_content(text: str) -> bool:
-    """Return ``True`` when *text* contains non-whitespace characters after
-    the first balanced JSON object/array.
-
-    This detects the hallucination pattern where a model generates a valid
-    JSON response and then keeps writing (extra tool calls, fake results,
-    etc.).  Only the portion **after** the first closing delimiter is
-    inspected -- leading text before the JSON is not considered trailing.
-    """
+def _get_trailing_content(text: str) -> str:
+    """Return any non-whitespace text after the first balanced JSON object."""
     first_brace = text.find("{")
     first_bracket = text.find("[")
 
@@ -251,7 +258,7 @@ def has_trailing_content(text: str) -> bool:
         candidates.append((first_bracket, "[", "]"))
 
     if not candidates:
-        return False
+        return ""
 
     candidates.sort(key=lambda c: c[0])
 
@@ -259,10 +266,16 @@ def has_trailing_content(text: str) -> bool:
         end = _find_balanced_end(text, start, open_ch, close_ch)
         if end == -1:
             continue
-        remainder = text[end + 1 :].strip()
-        return len(remainder) > 0
+        return text[end + 1 :].strip()
 
-    return False
+    return ""
+
+
+def has_trailing_content(text: str) -> bool:
+    """Return ``True`` when *text* contains non-whitespace characters after
+    the first balanced JSON object/array.
+    """
+    return len(_get_trailing_content(text)) > 0
 
 
 def parse_json_string(text: str) -> Union[dict, list, str]:
@@ -419,12 +432,18 @@ def parse_json_response(text: str) -> Tuple[str, Optional[List[dict]]]:
         raise ToolCallParseError(
             'Missing required "content" field in JSON response', text
         )
+    if isinstance(content, (dict, list)):
+        # deep_parse_json recursively parsed a stringified-JSON content field.
+        # Serialize back to string rather than raising — this preserves all
+        # information when the model double-encodes its response.
+        content = json.dumps(content, ensure_ascii=False)
     if not isinstance(content, str):
         raise ToolCallParseError(
             f'"content" must be a string, got {type(content).__name__}', text
         )
 
     raw_tool_calls = result.get("commands")
+
     if raw_tool_calls is None:
         return content, None
 
@@ -444,6 +463,7 @@ class _ExtractorState(Enum):
     SEEKING_CONTENT = auto()
     IN_CONTENT_STRING = auto()
     AFTER_CONTENT = auto()
+    TRAILING_PASSTHROUGH = auto()
     PASSTHROUGH = auto()
 
 
@@ -492,7 +512,17 @@ class IncrementalJsonContentExtractor:
         if self._state == _ExtractorState.PASSTHROUGH:
             return chunk
 
+        if self._state == _ExtractorState.TRAILING_PASSTHROUGH:
+            buf = self._full_buffer()
+            after = buf[self._json_end_pos + 1:].lstrip()
+            new_chars = after[self._trailing_yielded:]
+            self._trailing_yielded = len(after)
+            return new_chars
+
         if self._state == _ExtractorState.AFTER_CONTENT:
+            trailing = self._check_json_closed_and_trailing()
+            if trailing is not None:
+                return trailing
             return ""
 
         if self._state == _ExtractorState.SEEKING_CONTENT:
@@ -511,19 +541,23 @@ class IncrementalJsonContentExtractor:
     def content_complete(self) -> bool:
         """True once all streamable content has been yielded.
 
-        This covers both the normal case (closing ``"`` of the JSON
-        content string found) and passthrough mode (all raw chunks
-        forwarded directly).
+        This covers the normal case (closing ``"`` of the JSON content
+        string found), trailing passthrough (post-JSON text being
+        streamed), and plain passthrough mode.
         """
         return self._state in (
             _ExtractorState.AFTER_CONTENT,
+            _ExtractorState.TRAILING_PASSTHROUGH,
             _ExtractorState.PASSTHROUGH,
         )
 
     @property
     def is_passthrough(self) -> bool:
         """True when the extractor gave up on JSON and streams raw text."""
-        return self._state == _ExtractorState.PASSTHROUGH
+        return self._state in (
+            _ExtractorState.PASSTHROUGH,
+            _ExtractorState.TRAILING_PASSTHROUGH,
+        )
 
     def get_full_text(self) -> str:
         """Return the complete raw buffer for final JSON parsing."""
@@ -535,8 +569,35 @@ class IncrementalJsonContentExtractor:
 
     # ---- internals -------------------------------------------------
 
+    _json_end_pos: int = -1
+    _trailing_yielded: int = 0
+
     def _full_buffer(self) -> str:
         return "".join(self._buffer)
+
+    def _check_json_closed_and_trailing(self) -> Optional[str]:
+        """After ``"content"`` extraction, look for the root JSON ``}``
+        closing brace.  Once found, any non-whitespace text after it is
+        trailing content that should be streamed directly.
+
+        Returns the trailing text to yield, or ``None`` if the root JSON
+        hasn't closed yet.
+        """
+        buf = self._full_buffer()
+        if self._json_end_pos < 0:
+            end = _find_balanced_end(buf, 0, "{", "}")
+            if end < 0:
+                return None
+            self._json_end_pos = end
+
+        after = buf[self._json_end_pos + 1:]
+        stripped = after.lstrip()
+        if not stripped:
+            return None
+
+        self._state = _ExtractorState.TRAILING_PASSTHROUGH
+        self._trailing_yielded = len(stripped)
+        return stripped
 
     def _should_switch_to_passthrough(self) -> bool:
         """Decide whether to abandon JSON extraction and stream raw text.
@@ -607,13 +668,23 @@ class IncrementalJsonContentExtractor:
                     new_chars.append("\b")
                 elif ch == "f":
                     new_chars.append("\f")
-                elif ch == "u" and i + 4 < len(buf):
-                    hex_str = buf[i + 1 : i + 5]
-                    try:
-                        new_chars.append(chr(int(hex_str, 16)))
-                    except ValueError:
-                        new_chars.append("\\u" + hex_str)
-                    i += 4
+                elif ch == "u":
+                    if i + 4 < len(buf):
+                        hex_str = buf[i + 1 : i + 5]
+                        try:
+                            new_chars.append(chr(int(hex_str, 16)))
+                        except ValueError:
+                            new_chars.append("\\u" + hex_str)
+                        i += 4
+                    else:
+                        # Hex digits have not arrived yet in this chunk.
+                        # Rewind scan_pos to the backslash (i - 1) so the
+                        # next feed() call reprocesses the full \uXXXX sequence.
+                        self._escape_next = False
+                        self._scan_pos = i - 1
+                        self._content_chars.extend(new_chars)
+                        self._content_yielded = len(self._content_chars)
+                        return "".join(new_chars)
                 else:
                     new_chars.append(ch)
                 self._escape_next = False

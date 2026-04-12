@@ -17,6 +17,17 @@ from langchain_core.tools import tool
 from langchain_tessai import ChatTessAI
 from langchain_tessai.chat_models import FileRef
 
+def _strip_json_reminder(msgs: list[dict]) -> list[dict]:
+    """Strip the JSON-format reminder suffix appended by _build_payload_from_converted."""
+    import re
+    result = []
+    for m in msgs:
+        c = m.get("content", "")
+        c = re.sub(r"\n\n\[ONE JSON ONLY\].*$", "", c, flags=re.DOTALL)
+        result.append({**m, "content": c})
+    return result
+
+
 API_KEY = "test-api-key-123"
 AGENT_ID = 8794
 BASE_URL = "https://api.tess.im"
@@ -283,7 +294,8 @@ class TestGenerate:
 
         with patch.object(httpx.Client, "post", return_value=mock_execute), \
              patch.object(httpx.Client, "get", return_value=failed_poll):
-            with pytest.raises(RuntimeError, match="Something went wrong"):
+            from langchain_tessai.exceptions import TessServerError
+            with pytest.raises(TessServerError, match="Something went wrong"):
                 llm.invoke("hello")
 
 
@@ -406,6 +418,79 @@ class TestAsyncStream:
         meta_chunks = [c for c in chunks if c.response_metadata.get("credits")]
         assert any(c.response_metadata["credits"] == 0.003 for c in meta_chunks)
 
+    @pytest.mark.asyncio
+    async def test_astream_passthrough_no_raw_json_in_output(self) -> None:
+        """When the extractor enters passthrough mode (model didn't follow the JSON
+        protocol), raw JSON must NOT appear in the accumulated streaming content.
+        The final chunk should deliver the fully-parsed content once, with no
+        duplication and no JSON wrapper."""
+        llm = _make_llm()
+
+        # Simulate a model that starts with 50+ chars of preamble before the
+        # JSON — enough to trigger the passthrough threshold (40 chars).
+        preamble = "A" * 50
+        json_body = '{"content": "# Markdown\\n\\nSome **bold** text."}'
+        raw_output = f"{preamble}{json_body}"
+        events = [
+            {"id": 300, "status": "running", "output": raw_output, "error": None,
+             "credits": None, "root_id": 300, "template_id": 10},
+            {"id": 300, "status": "completed", "output": "", "error": None,
+             "credits": 0.005, "root_id": 300, "template_id": 10},
+        ]
+
+        class FakeAsyncStreamResponse:
+            def __init__(self) -> None:
+                self.status_code = 200
+
+            def raise_for_status(self) -> None:
+                pass
+
+            async def aiter_lines(self):
+                import json as _json
+                for event in events:
+                    yield f"data: {_json.dumps(event)}"
+                    yield ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class FakeAsyncClient:
+            def stream(self, *args, **kwargs):
+                return FakeAsyncStreamResponse()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        with patch.object(llm, "_async_client", return_value=FakeAsyncClient()):
+            chunks = []
+            async for chunk in llm.astream("hello"):
+                chunks.append(chunk)
+
+        accumulated = "".join(c.content for c in chunks)
+
+        # Must NOT contain raw JSON wrapper
+        assert '{"content"' not in accumulated, (
+            f"Raw JSON wrapper leaked into streaming output: {accumulated!r}"
+        )
+        # Must contain the properly decoded Markdown
+        assert "# Markdown" in accumulated
+        assert "**bold**" in accumulated
+        # Must NOT be duplicated
+        assert accumulated.count("# Markdown") == 1, (
+            f"Content duplicated in streaming output: {accumulated!r}"
+        )
+        # Final chunk must NOT have tool_calls key (empty list) set
+        final_chunk = chunks[-1]
+        assert not final_chunk.tool_calls, (
+            "Final chunk should not carry empty tool_calls"
+        )
+
 
 # ------------------------------------------------------------------
 # SSE parsing
@@ -495,7 +580,9 @@ class TestBuildPayloadFromConverted:
         msgs = [{"role": "user", "content": "hi"}]
         payload = llm._build_payload_from_converted(msgs, stream=False)
         assert "root_id" not in payload
-        assert payload["messages"] == msgs
+        assert payload["messages"][0]["role"] == "user"
+        assert payload["messages"][0]["content"].startswith("hi")
+        assert "[ONE JSON ONLY]" in payload["messages"][0]["content"]
 
     def test_payload_with_root_id(self) -> None:
         llm = _make_llm()
@@ -504,7 +591,24 @@ class TestBuildPayloadFromConverted:
             msgs, stream=False, root_id=999
         )
         assert payload["root_id"] == 999
-        assert payload["messages"] == msgs
+        assert payload["messages"][0]["role"] == "user"
+        assert payload["messages"][0]["content"].startswith("follow-up")
+
+    def test_payload_json_reminder_with_tools(self) -> None:
+        llm = _make_llm()
+        msgs = [{"role": "user", "content": "use tools"}]
+        tools = [{"type": "function", "function": {"name": "test"}}]
+        payload = llm._build_payload_from_converted(
+            msgs, stream=False, bound_tools=tools
+        )
+        assert '"commands"' in payload["messages"][0]["content"]
+
+    def test_payload_json_reminder_no_tools(self) -> None:
+        llm = _make_llm()
+        msgs = [{"role": "user", "content": "hello"}]
+        payload = llm._build_payload_from_converted(msgs, stream=False)
+        assert '"commands"' not in payload["messages"][0]["content"]
+        assert '"content"' in payload["messages"][0]["content"]
 
 
 # ------------------------------------------------------------------
@@ -555,7 +659,8 @@ class TestConversationTracking:
         p = captured_payloads[0]
         assert "root_id" not in p
         assert p["messages"][0]["role"] == "developer"
-        assert p["messages"][-1] == {"role": "user", "content": "hi"}
+        assert p["messages"][-1]["role"] == "user"
+        assert p["messages"][-1]["content"].startswith("hi")
 
     def test_continuation_sends_delta_with_root_id(self) -> None:
         llm = _make_llm(wait_execution=True)
@@ -593,7 +698,7 @@ class TestConversationTracking:
 
         p2 = captured_payloads[1]
         assert p2["root_id"] == 5001
-        assert p2["messages"] == [{"role": "user", "content": "B"}]
+        assert _strip_json_reminder(p2["messages"]) == [{"role": "user", "content": "B"}]
 
     def test_edited_history_sends_all_without_root_id(self) -> None:
         llm = _make_llm(wait_execution=True)
@@ -628,7 +733,7 @@ class TestConversationTracking:
         assert "root_id" not in p2
         roles = [m["role"] for m in p2["messages"]]
         assert roles == ["developer", "user", "assistant", "user"]
-        assert p2["messages"][-1]["content"] == "B"
+        assert p2["messages"][-1]["content"].startswith("B")
 
     def test_three_step_continuation(self) -> None:
         llm = _make_llm(wait_execution=True)
@@ -665,11 +770,11 @@ class TestConversationTracking:
 
         assert "root_id" not in captured_payloads[0]
         assert captured_payloads[1]["root_id"] == 5001
-        assert captured_payloads[1]["messages"] == [
+        assert _strip_json_reminder(captured_payloads[1]["messages"]) == [
             {"role": "user", "content": "C"}
         ]
         assert captured_payloads[2]["root_id"] == 5001
-        assert captured_payloads[2]["messages"] == [
+        assert _strip_json_reminder(captured_payloads[2]["messages"]) == [
             {"role": "user", "content": "E"}
         ]
 
@@ -725,7 +830,7 @@ class TestConversationTracking:
         delta = captured_payloads[1]["messages"]
         assert len(delta) == 1
         assert delta[0]["role"] == "user"
-        assert "[Command Result]" in delta[0]["content"]
+        assert "[Command Result:" in delta[0]["content"]
 
 
 class TestConversationTrackingDisabled:
@@ -888,11 +993,11 @@ class TestConversationTrackingMultipleConversations:
 
         p3 = captured_payloads[2]
         assert p3["root_id"] == 1000
-        assert p3["messages"] == [{"role": "user", "content": "conv-A-msg2"}]
+        assert _strip_json_reminder(p3["messages"]) == [{"role": "user", "content": "conv-A-msg2"}]
 
         p4 = captured_payloads[3]
         assert p4["root_id"] == 2000
-        assert p4["messages"] == [{"role": "user", "content": "conv-B-msg2"}]
+        assert _strip_json_reminder(p4["messages"]) == [{"role": "user", "content": "conv-B-msg2"}]
 
 
 class TestConversationTrackingAsync:
@@ -931,7 +1036,7 @@ class TestConversationTrackingAsync:
 
         p2 = captured_payloads[1]
         assert p2["root_id"] == 5001
-        assert p2["messages"] == [{"role": "user", "content": "B"}]
+        assert _strip_json_reminder(p2["messages"]) == [{"role": "user", "content": "B"}]
 
 
 class TestConversationTrackingStream:
@@ -969,7 +1074,7 @@ class TestConversationTrackingStream:
 
         p2 = captured_payloads[1]
         assert p2["root_id"] == 5001
-        assert p2["messages"] == [{"role": "user", "content": "B"}]
+        assert _strip_json_reminder(p2["messages"]) == [{"role": "user", "content": "B"}]
 
 
 # ------------------------------------------------------------------
@@ -1013,7 +1118,7 @@ class TestContinuationFallback:
 
         p2 = captured_payloads[1]
         assert p2["root_id"] == 5001
-        assert p2["messages"] == [{"role": "user", "content": "B"}]
+        assert _strip_json_reminder(p2["messages"]) == [{"role": "user", "content": "B"}]
 
         p3 = captured_payloads[2]
         assert "root_id" not in p3
@@ -2301,3 +2406,383 @@ class TestTokenCounting:
         assert usage["input_tokens"] > 0
         assert usage["output_tokens"] > 0
         assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+
+
+# ==================================================================
+# New tests for edge-case containment fixes
+# ==================================================================
+
+
+# ------------------------------------------------------------------
+# Fix 3: polling failure raises TessServerError (not RuntimeError)
+# ------------------------------------------------------------------
+
+class TestPollingErrorType:
+    def test_failed_poll_raises_tess_server_error(self) -> None:
+        """Polling failure must raise TessServerError so it goes through retry logic."""
+        from langchain_tessai.exceptions import TessServerError
+
+        llm = _make_llm(wait_execution=False, polling_interval=0.01, max_retries=0)
+        mock_execute = httpx.Response(
+            200,
+            json=EXECUTE_RESPONSE_STARTING,
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        failed_poll = httpx.Response(
+            200,
+            json={"id": 5002, "status": "error", "output": "", "error": "exec error"},
+            request=httpx.Request("GET", f"{BASE_URL}/agent-responses/5002"),
+        )
+        with patch.object(httpx.Client, "post", return_value=mock_execute), \
+             patch.object(httpx.Client, "get", return_value=failed_poll):
+            with pytest.raises(TessServerError, match="exec error"):
+                llm.invoke("hello")
+
+
+# ------------------------------------------------------------------
+# Fix 4: polling timeout raises TimeoutError
+# ------------------------------------------------------------------
+
+class TestPollingTimeout:
+    def test_sync_poll_timeout_raises(self) -> None:
+        """_poll_for_result raises TimeoutError after max_poll_attempts."""
+        llm = _make_llm(
+            wait_execution=False, polling_interval=0.001, max_poll_attempts=2, max_retries=0
+        )
+        mock_execute = httpx.Response(
+            200,
+            json=EXECUTE_RESPONSE_STARTING,
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        running_poll = httpx.Response(
+            200,
+            json={"id": 5002, "status": "running", "output": ""},
+            request=httpx.Request("GET", f"{BASE_URL}/agent-responses/5002"),
+        )
+        with patch.object(httpx.Client, "post", return_value=mock_execute), \
+             patch.object(httpx.Client, "get", return_value=running_poll):
+            with pytest.raises(TimeoutError, match="timed out"):
+                llm.invoke("hello")
+
+    @pytest.mark.asyncio
+    async def test_async_poll_timeout_raises(self) -> None:
+        """_apoll_for_result raises TimeoutError after max_poll_attempts."""
+        llm = _make_llm(
+            wait_execution=False, polling_interval=0.001, max_poll_attempts=2, max_retries=0
+        )
+        mock_execute = httpx.Response(
+            200,
+            json=EXECUTE_RESPONSE_STARTING,
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        running_poll = httpx.Response(
+            200,
+            json={"id": 5002, "status": "running", "output": ""},
+            request=httpx.Request("GET", f"{BASE_URL}/agent-responses/5002"),
+        )
+        with patch.object(httpx.AsyncClient, "post", return_value=mock_execute), \
+             patch.object(httpx.AsyncClient, "get", return_value=running_poll):
+            with pytest.raises(TimeoutError, match="timed out"):
+                await llm.ainvoke("hello")
+
+    def test_max_poll_attempts_default_is_120(self) -> None:
+        llm = _make_llm()
+        assert llm.max_poll_attempts == 120
+
+    def test_max_file_poll_attempts_default_is_60(self) -> None:
+        llm = _make_llm()
+        assert llm.max_file_poll_attempts == 60
+
+
+# ------------------------------------------------------------------
+# Fix 1: tool_choice forwarded in _astream HTTP error fallback
+# ------------------------------------------------------------------
+
+class TestAStreamToolChoiceFallback:
+    @pytest.mark.asyncio
+    async def test_tool_choice_forwarded_on_http_error_fallback(self) -> None:
+        """tool_choice must be passed to _agenerate when the SSE stream fails."""
+        llm = _make_llm(wait_execution=True, max_retries=0)
+        captured_kwargs: list[dict] = []
+
+        async def fake_agenerate(messages, stop=None, run_manager=None, **kwargs):
+            captured_kwargs.append(kwargs)
+            from langchain_core.outputs import ChatResult, ChatGeneration
+            msg = AIMessage(content="fallback response")
+            return ChatResult(generations=[ChatGeneration(message=msg)])
+
+        class FailingStream:
+            status_code = 200
+            def raise_for_status(self) -> None:
+                raise httpx.HTTPStatusError(
+                    "503 Service Unavailable",
+                    request=httpx.Request("POST", "url"),
+                    response=httpx.Response(503),
+                )
+            async def aiter_lines(self):
+                return
+                yield  # noqa: unreachable — makes this an async generator
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        class FakeClient:
+            def stream(self, *a, **kw): return FailingStream()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        @tool
+        def my_tool(x: int) -> str:
+            """A tool."""
+            return str(x)
+
+        with patch.object(llm, "_agenerate", fake_agenerate), \
+             patch.object(llm, "_async_client", return_value=FakeClient()), \
+             patch.object(llm, "_aresolve_file_ids", return_value=[]):
+            chunks = []
+            async for chunk in llm._astream(
+                [HumanMessage(content="test")],
+                tools=[{"type": "function", "function": {"name": "my_tool", "description": "A tool.", "parameters": {}}}],
+                tool_choice="required",
+            ):
+                chunks.append(chunk)
+
+        assert len(captured_kwargs) == 1, "fallback _agenerate should have been called"
+        assert captured_kwargs[0].get("tool_choice") == "required", (
+            "tool_choice must survive the HTTP error fallback"
+        )
+
+
+# ------------------------------------------------------------------
+# Fix 2: _invalidate_root_id safety
+# ------------------------------------------------------------------
+
+class TestInvalidateRootIdSafety:
+    def test_missing_from_cache_order_does_not_raise(self) -> None:
+        """_invalidate_root_id must not raise even when an entry is absent from _cache_order."""
+        llm = _make_llm()
+        h = "deadbeefhash"
+        # Manually insert into the dict but NOT into _cache_order to simulate desync.
+        llm._conversation_cache[h] = (999, 2)
+        # Should not raise ValueError
+        llm._invalidate_root_id(999)
+        assert h not in llm._conversation_cache
+
+
+# ------------------------------------------------------------------
+# Fix 7: retry_after minimum of 1 second
+# ------------------------------------------------------------------
+
+class TestRetryAfterMinimum:
+    def test_zero_retry_after_sleeps_at_least_one_second(self) -> None:
+        """retry_after=0 in a 429 response must sleep at least 1 second."""
+        sleep_calls: list[float] = []
+
+        def fake_sleep(t: float) -> None:
+            sleep_calls.append(t)
+
+        llm = _make_llm(max_retries=1)
+        rate_limit_resp = httpx.Response(
+            429,
+            json={"error": "rate limited", "retry_after": 0},
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        ok_resp = httpx.Response(
+            200,
+            json=EXECUTE_RESPONSE_COMPLETED,
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        call_count = 0
+
+        def side_effect(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            return rate_limit_resp if call_count == 1 else ok_resp
+
+        with patch.object(httpx.Client, "post", side_effect=side_effect), \
+             patch("langchain_tessai.chat_models.time.sleep", side_effect=fake_sleep):
+            llm.invoke("hello")
+
+        assert sleep_calls, "sleep must have been called"
+        assert all(t >= 1 for t in sleep_calls), (
+            f"All sleep durations must be >= 1, got {sleep_calls}"
+        )
+
+
+# ------------------------------------------------------------------
+# Fix 9: finish_reason in response_metadata
+# ------------------------------------------------------------------
+
+class TestFinishReason:
+    def test_finish_reason_stop_for_content_response(self) -> None:
+        """Content-only responses must have finish_reason='stop'."""
+        llm = _make_llm(wait_execution=True)
+        mock_response = httpx.Response(
+            200,
+            json=EXECUTE_RESPONSE_COMPLETED,
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        with patch.object(httpx.Client, "post", return_value=mock_response):
+            result = llm.invoke("hello")
+        assert result.response_metadata.get("finish_reason") == "stop"
+
+    def test_finish_reason_tool_calls_when_tools_used(self) -> None:
+        """Tool-call responses must have finish_reason='tool_calls'."""
+        @tool
+        def get_weather(city: str) -> str:
+            """Get weather."""
+            return "sunny"
+
+        llm = _make_llm(wait_execution=True)
+        tool_response_json = json.dumps({
+            "content": "",
+            "commands": [{"name": "get_weather", "arguments": {"city": "SP"}}]
+        })
+        mock_response = httpx.Response(
+            200,
+            json={
+                "template_id": "8794",
+                "responses": [{
+                    "id": 5001, "status": "succeeded",
+                    "output": tool_response_json,
+                    "credits": 0, "root_id": 5001, "template_id": 8794,
+                }]
+            },
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        with patch.object(httpx.Client, "post", return_value=mock_response):
+            result = llm.bind_tools([get_weather]).invoke("weather?")
+        assert result.response_metadata.get("finish_reason") == "tool_calls"
+
+
+# ------------------------------------------------------------------
+# Fix 10: tool_choice="required" validation in retry loop
+# ------------------------------------------------------------------
+
+class TestToolChoiceRequired:
+    def test_required_retries_when_model_ignores_tools(self) -> None:
+        """tool_choice='required' retries when model returns content without tool calls."""
+        call_count = 0
+        content_only = json.dumps({"content": "I'll just answer directly."})
+        tool_response = json.dumps({
+            "content": "",
+            "commands": [{"name": "get_weather", "arguments": {"city": "SP"}}],
+        })
+
+        def side_effect(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            output = content_only if call_count == 1 else tool_response
+            return httpx.Response(
+                200,
+                json={
+                    "template_id": "8794",
+                    "responses": [{
+                        "id": 5001, "status": "succeeded",
+                        "output": output,
+                        "credits": 0, "root_id": 5001, "template_id": 8794,
+                    }]
+                },
+                request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+            )
+
+        @tool
+        def get_weather(city: str) -> str:
+            """Get weather."""
+            return "sunny"
+
+        llm = _make_llm(max_retries=1)
+        with patch.object(httpx.Client, "post", side_effect=side_effect), \
+             patch("langchain_tessai.chat_models.time.sleep"):
+            result = llm.bind_tools([get_weather], tool_choice="required").invoke("weather?")
+
+        assert call_count == 2, "Should have retried exactly once"
+        assert result.tool_calls, "Final response must have tool calls"
+        assert result.tool_calls[0]["name"] == "get_weather"
+
+    def test_required_raises_after_all_retries_exhausted(self) -> None:
+        """After all retries fail tool_choice validation, ValueError is raised."""
+        content_only = json.dumps({"content": "nope, no tools"})
+        mock_response = httpx.Response(
+            200,
+            json={
+                "template_id": "8794",
+                "responses": [{
+                    "id": 5001, "status": "succeeded",
+                    "output": content_only,
+                    "credits": 0, "root_id": 5001, "template_id": 8794,
+                }]
+            },
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+
+        @tool
+        def get_weather(city: str) -> str:
+            """Get weather."""
+            return "sunny"
+
+        llm = _make_llm(max_retries=1)
+        with patch.object(httpx.Client, "post", return_value=mock_response), \
+             patch("langchain_tessai.chat_models.time.sleep"):
+            with pytest.raises(ValueError, match="tool calls"):
+                llm.bind_tools([get_weather], tool_choice="required").invoke("test")
+
+
+# ------------------------------------------------------------------
+# Fix 11: with_structured_output Pydantic validation error handling
+# ------------------------------------------------------------------
+
+class TestStructuredOutputValidationError:
+    def test_validation_error_with_include_raw_returns_parsing_error(self) -> None:
+        """Pydantic validation error returns parsing_error dict when include_raw=True."""
+        from pydantic import BaseModel
+
+        class Weather(BaseModel):
+            city: str
+            temperature: int  # model will send a string — should fail
+
+        # Model returns "temperature" as a string instead of int
+        tool_response = json.dumps({
+            "content": "",
+            "commands": [{"name": "Weather", "arguments": {"city": "SP", "temperature": "warm"}}],
+        })
+        mock_response = httpx.Response(
+            200,
+            json={
+                "template_id": "8794",
+                "responses": [{
+                    "id": 5001, "status": "succeeded",
+                    "output": tool_response,
+                    "credits": 0, "root_id": 5001, "template_id": 8794,
+                }]
+            },
+            request=httpx.Request("POST", f"{BASE_URL}/agents/{AGENT_ID}/execute"),
+        )
+        llm = _make_llm()
+        with patch.object(httpx.Client, "post", return_value=mock_response):
+            result = llm.with_structured_output(Weather, include_raw=True).invoke("weather?")
+
+        assert result["parsed"] is None
+        assert result["parsing_error"] is not None
+        assert result["raw"] is not None
+
+
+# ------------------------------------------------------------------
+# Fix 12: unknown message type warning
+# ------------------------------------------------------------------
+
+class TestUnknownMessageTypeWarning:
+    def test_unknown_message_type_logged(self, caplog) -> None:
+        """Unknown message types must be logged as warnings and treated as 'user'."""
+        import logging
+        from langchain_core.messages import BaseMessage
+
+        class WeirdMessage(BaseMessage):
+            type: str = "weird"
+
+        with caplog.at_level(logging.WARNING, logger="langchain_tessai.chat_models"):
+            result = ChatTessAI._convert_messages([WeirdMessage(content="hello")])
+
+        assert result == [{"role": "user", "content": "hello"}]
+        assert any("WeirdMessage" in r.message for r in caplog.records), (
+            "Warning must mention the unknown message class name"
+        )
